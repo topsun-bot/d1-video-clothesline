@@ -2,6 +2,7 @@
 # D1 视频晾衣绳 — 启动 / 退出
 #   ./scripts/run_mac_clothesline.sh            # 启动（没编译过会自动编译）
 #   ./scripts/run_mac_clothesline.sh --rebuild  # 重新编译后启动
+#   ./scripts/run_mac_clothesline.sh --rollback # 一键回退到 v1.0.0-stable 稳定版并重新编译启动
 #   ./scripts/run_mac_clothesline.sh --stop     # 退出
 set -euo pipefail
 
@@ -15,6 +16,25 @@ if [[ "${1:-}" == "--stop" ]]; then
     else
         echo "ℹ️  D1 视频晾衣绳没有在运行"
     fi
+    exit 0
+fi
+
+if [[ "${1:-}" == "--rollback" ]]; then
+    TARGET_TAG="${2:-v1.0.0-stable}"
+    echo "⏪ 正在将 D1Clothesline & D1LiveMonitor 回退至稳定标签 ${TARGET_TAG}..."
+    git -C "${REPO_ROOT}" checkout "${TARGET_TAG}" -- \
+        macos_clothesline/D1Clothesline.swift \
+        macos_clothesline/build_app.sh \
+        macos_clothesline/README.md \
+        macos_monitor/D1LiveMonitor.swift \
+        macos_monitor/build_app.sh \
+        scripts/run_mac_floating_monitor.sh
+    "${REPO_ROOT}/macos_clothesline/build_app.sh"
+    "${REPO_ROOT}/macos_monitor/build_app.sh"
+    pkill -f "${PROC_PATTERN}" >/dev/null 2>&1 || true
+    sleep 0.3
+    open -a "${APP_BUNDLE}"
+    echo "✅ 已回退至 ${TARGET_TAG} 并重新启动 D1 视频晾衣绳"
     exit 0
 fi
 

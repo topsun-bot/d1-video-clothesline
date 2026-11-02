@@ -387,9 +387,15 @@ private func loadLocalStreamConfig(_ key: String, fallback: String) -> String {
 final class LiveStreamController {
     let state: MonitorState
     let onFrameUpdate: () -> Void
-    private var running = true
+    private var _running = true
     private var ffmpegProcess: Process?
+    private var ffmpegLaunchedAt: Date = .distantPast
     private let processLock = NSLock()
+
+    var isRunning: Bool {
+        get { processLock.lock(); defer { processLock.unlock() }; return _running }
+        set { processLock.lock(); _running = newValue; processLock.unlock() }
+    }
 
     let rtspSubURL = loadLocalStreamConfig(
         "D1_RTSP_SUB_STREAM",
@@ -408,8 +414,12 @@ final class LiveStreamController {
     }
 
     func start() {
+        isRunning = true
         Thread.detachNewThread { [weak self] in
             self?.videoStreamLoop()
+        }
+        Thread.detachNewThread { [weak self] in
+            self?.streamWatchdogLoop()
         }
         Thread.detachNewThread { [weak self] in
             self?.telemetryLoop()
@@ -417,7 +427,7 @@ final class LiveStreamController {
     }
 
     func stop() {
-        running = false
+        isRunning = false
         terminateFFmpeg()
     }
 
@@ -434,6 +444,26 @@ final class LiveStreamController {
         ffmpegProcess = nil
     }
 
+    private func streamWatchdogLoop() {
+        while isRunning {
+            Thread.sleep(forTimeInterval: 2.0)
+            processLock.lock()
+            let proc = ffmpegProcess
+            let launched = ffmpegLaunchedAt
+            processLock.unlock()
+
+            state.lock.lock()
+            let lastTime = state.lastFrameTime
+            state.lock.unlock()
+
+            let now = Date().timeIntervalSince1970
+            let stale = (lastTime > 0 && (now - lastTime) > 6.0)
+            if let proc, proc.isRunning, stale, Date().timeIntervalSince(launched) > 8.0 {
+                proc.terminate()
+            }
+        }
+    }
+
     private func resolveFFmpegPath() -> String {
         let candidates = [
             "/opt/homebrew/bin/ffmpeg",
@@ -447,7 +477,7 @@ final class LiveStreamController {
     }
 
     private func videoStreamLoop() {
-        while running {
+        while isRunning {
             state.lock.lock()
             let mode = state.streamMode
             state.lock.unlock()
@@ -458,7 +488,7 @@ final class LiveStreamController {
                 let url = (mode == .rtspHD) ? rtspHDURL : rtspSubURL
                 runFFmpegMJPEGPipe(rtspURL: url, isHD: mode == .rtspHD)
             }
-            Thread.sleep(forTimeInterval: 0.4)
+            if isRunning { Thread.sleep(forTimeInterval: 0.4) }
         }
     }
 
@@ -471,8 +501,9 @@ final class LiveStreamController {
         sessionCfg.timeoutIntervalForRequest = 1.5
         sessionCfg.timeoutIntervalForResource = 2.0
         let session = URLSession(configuration: sessionCfg)
+        defer { session.finishTasksAndInvalidate() }
 
-        while running {
+        while isRunning {
             state.lock.lock()
             let currentMode = state.streamMode
             state.lock.unlock()
@@ -527,9 +558,12 @@ final class LiveStreamController {
         let outPipe = Pipe()
         proc.standardOutput = outPipe
         proc.standardError = FileHandle.nullDevice
+        let handle = outPipe.fileHandleForReading
+        defer { try? handle.close() }
 
         processLock.lock()
         ffmpegProcess = proc
+        ffmpegLaunchedAt = Date()
         processLock.unlock()
 
         state.lock.lock()
@@ -548,12 +582,11 @@ final class LiveStreamController {
             return
         }
 
-        let handle = outPipe.fileHandleForReading
         var buffer = Data()
         let soiMarker = Data([0xFF, 0xD8])
         let eoiMarker = Data([0xFF, 0xD9])
 
-        while running && proc.isRunning {
+        while isRunning && proc.isRunning {
             let chunk = handle.availableData
             if chunk.isEmpty {
                 break
@@ -613,10 +646,11 @@ final class LiveStreamController {
         let sessionCfg = URLSessionConfiguration.ephemeral
         sessionCfg.timeoutIntervalForRequest = 0.8
         let session = URLSession(configuration: sessionCfg)
+        defer { session.finishTasksAndInvalidate() }
         let statusURL = URL(string: "\(hubBaseURL)/api/status")
 
         var tick = 0
-        while running {
+        while isRunning {
             // 1. Direct UDP query to 10.10.137.101..103:19001
             for key in ["left_103", "center_102", "right_101"] {
                 state.lock.lock()

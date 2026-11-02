@@ -231,12 +231,37 @@ final class ScreenshotWatcher {
 
 func isRecordingFile(_ url: URL) -> Bool { ["mov", "mp4"].contains(url.pathExtension.lowercased()) }
 
+private let shotTimeFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "HH:mm:ss"
+    return f
+}()
+
+private let fileStampFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "yyyyMMdd_HHmmss"
+    return f
+}()
+
+private let captureStampFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd HH.mm.ss"
+    return f
+}()
+
 func makeThumbnail(_ url: URL) -> CGImage? {
     if isRecordingFile(url) {
         let gen = AVAssetImageGenerator(asset: AVURLAsset(url: url))
         gen.appliesPreferredTrackTransform = true
         gen.maximumSize = CGSize(width: 700, height: 700)
-        return try? gen.copyCGImage(at: CMTime(seconds: 0.1, preferredTimescale: 600), actualTime: nil)
+        let sem = DispatchSemaphore(value: 0)
+        var result: CGImage?
+        gen.generateCGImageAsynchronously(for: CMTime(seconds: 0.1, preferredTimescale: 600)) { img, _, _ in
+            result = img
+            sem.signal()
+        }
+        _ = sem.wait(timeout: .now() + 1.5)
+        return result
     }
     guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
     let opts: [CFString: Any] = [
@@ -250,10 +275,8 @@ func makeThumbnail(_ url: URL) -> CGImage? {
 func shotSpec(_ url: URL, thumb: CGImage) -> FeedSpec {
     let aspect = min(2.2, max(0.6, CGFloat(thumb.width) / CGFloat(max(1, thumb.height))))
     let date = (try? url.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date()
-    let f = DateFormatter()
-    f.dateFormat = "HH:mm:ss"
     let rec = isRecordingFile(url)
-    return FeedSpec(id: "shot:" + url.path, title: (rec ? "录屏 " : "截图 ") + f.string(from: date),
+    return FeedSpec(id: "shot:" + url.path, title: (rec ? "录屏 " : "截图 ") + shotTimeFormatter.string(from: date),
                     crop: nil, armKey: nil, ip: nil, accent: NSColor(white: 0.85, alpha: 1),
                     fileURL: url, fixedAspect: aspect, isRecording: rec)
 }
@@ -288,8 +311,12 @@ final class FrameHub {
     private var _hd = false
     private var _lastFrameAt = Date.distantPast
     private var process: Process?
-    private var running = true
+    private var _running = true
 
+    var isRunning: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _running }
+        set { lock.lock(); _running = newValue; lock.unlock() }
+    }
     var needsFrames: Bool {
         get { lock.lock(); defer { lock.unlock() }; return _needsFrames }
         set { lock.lock(); _needsFrames = newValue; lock.unlock() }
@@ -303,12 +330,13 @@ final class FrameHub {
     }
 
     func start() {
+        isRunning = true
         Thread.detachNewThread { [weak self] in self?.loop() }
         Thread.detachNewThread { [weak self] in self?.watchdog() }
     }
 
     func stop() {
-        running = false
+        isRunning = false
         restart()
     }
 
@@ -324,15 +352,15 @@ final class FrameHub {
     }
 
     private func loop() {
-        while running {
+        while isRunning {
             runOnce()
-            if running { Thread.sleep(forTimeInterval: 0.8) }
+            if isRunning { Thread.sleep(forTimeInterval: 0.8) }
         }
     }
 
     /// ffmpeg can stall silently when the camera drops the session; kill it so the loop reconnects.
     private func watchdog() {
-        while running {
+        while isRunning {
             Thread.sleep(forTimeInterval: 2.0)
             lock.lock()
             let p = process
@@ -357,17 +385,18 @@ final class FrameHub {
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = FileHandle.nullDevice
+        let handle = pipe.fileHandleForReading
+        defer { try? handle.close() }
 
         do { try proc.run() } catch { return }
         proc.launchDate = Date()
         lock.lock(); process = proc; lock.unlock()
 
-        let handle = pipe.fileHandleForReading
         var buffer = Data()
         let soi = Data([0xFF, 0xD8])
         let eoi = Data([0xFF, 0xD9])
 
-        while running && proc.isRunning {
+        while isRunning && proc.isRunning {
             let chunk = handle.availableData
             if chunk.isEmpty { break }
             buffer.append(chunk)
@@ -424,12 +453,25 @@ final class Telemetry {
     let hubURL = ProcessInfo.processInfo.environment["D1_HUB_URL"] ?? "http://10.10.218.4:8899"
 
     private let lock = NSLock()
+    private var _running = true
     private var jointsByArm: [String: [Double]] = [:]
     private var seen: [String: Date] = [:]
     private var hub = Hub()
     private var hubSeen = Date.distantPast
 
-    func start() { Thread.detachNewThread { [weak self] in self?.loop() } }
+    var isRunning: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _running }
+        set { lock.lock(); _running = newValue; lock.unlock() }
+    }
+
+    func start() {
+        isRunning = true
+        Thread.detachNewThread { [weak self] in self?.loop() }
+    }
+
+    func stop() {
+        isRunning = false
+    }
 
     func joints(_ key: String) -> [Double]? {
         lock.lock(); defer { lock.unlock() }
@@ -448,9 +490,10 @@ final class Telemetry {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 0.8
         let session = URLSession(configuration: cfg)
+        defer { session.finishTasksAndInvalidate() }
         let statusURL = URL(string: "\(hubURL)/api/status")
         var tick = 0
-        while true {
+        while isRunning {
             for spec in allFeeds {
                 guard let key = spec.armKey, let ip = spec.ip, let j = Self.queryArm(ip: ip) else { continue }
                 lock.lock(); jointsByArm[key] = j; seen[key] = Date(); lock.unlock()
@@ -1343,14 +1386,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         }
     }
 
+    private var cleanedUp = false
+
     func applicationWillTerminate(_ notification: Notification) {
         cleanUpForExit()
     }
 
     /// Screenshots go back to where the user had them (the Desktop by default).
     func cleanUpForExit() {
+        guard !cleanedUp else { return }
+        cleanedUp = true
+        mouseTimer?.invalidate()
+        mouseTimer = nil
+        breezeTimer?.invalidate()
+        breezeTimer = nil
+        for m in clickMonitors { NSEvent.removeMonitor(m) }
+        clickMonitors.removeAll()
+        watcher.stop()
         ScreenshotInbox.restore()
         frames.stop()
+        telemetry.stop()
     }
 
     /// `kill` / `pkill` / logout never reach applicationWillTerminate, so the
