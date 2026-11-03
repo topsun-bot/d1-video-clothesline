@@ -26,6 +26,142 @@ enum Paths {
     static let pythonBin = repoRoot.appendingPathComponent(".venv/bin/python")
 }
 
+// MARK: - Structured Trace Logging & Safe File IO
+
+enum TraceLogger {
+    static func makeOperationId(prefix: String = "cl") -> String {
+        let rawUuid = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        return "\(prefix)-\(rawUuid.prefix(12))"
+    }
+
+    static func warn(operationId: String, component: String, message: String, error: Error? = nil) {
+        let errorSuffix = error.map { " | error=\($0.localizedDescription)" } ?? ""
+        fputs("[D1Clothesline][WARN][op=\(operationId)][\(component)] \(message)\(errorSuffix)\n", stderr)
+    }
+}
+
+enum FileIO {
+    @discardableResult
+    static func ensureDirectory(_ url: URL, operationId: String, context: String) -> Bool {
+        do {
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            return true
+        } catch {
+            TraceLogger.warn(
+                operationId: operationId,
+                component: "FileIO",
+                message: "createDirectory failed (\(context)): \(url.path)",
+                error: error
+            )
+            return false
+        }
+    }
+
+    @discardableResult
+    static func writeData(_ data: Data, to url: URL, operationId: String, context: String) -> Bool {
+        do {
+            try data.write(to: url, options: .atomic)
+            return true
+        } catch {
+            TraceLogger.warn(
+                operationId: operationId,
+                component: "FileIO",
+                message: "writeData failed (\(context)): \(url.path)",
+                error: error
+            )
+            return false
+        }
+    }
+}
+
+// MARK: - Typed Telemetry & Scene Graph Parsers (Pure Functions)
+
+struct HubStatusPayload: Decodable {
+    let continuous_mode: Bool?
+    let cycle_count: Int?
+    let current_skill: String?
+    let current_phase: String?
+}
+
+struct Insta360SceneGraphSnapshot: Equatable {
+    let online: Bool
+    let frames: Int
+    let ageMs: Int
+    let zClearanceMm: Double
+}
+
+struct Insta360SceneGraphParser {
+    private struct RawStatusMeta: Decodable {
+        let running: Bool?
+        let frames: Int?
+        let lastFrameAgeMs: Int?
+    }
+
+    private struct RawEntity: Decodable {
+        let entity_id: String?
+        let id: String?
+        let z_clearance_mm: Double?
+
+        var resolvedId: String { entity_id ?? id ?? "" }
+    }
+
+    private struct RawDocument: Decodable {
+        let status_meta: RawStatusMeta?
+        let status: RawStatusMeta?
+        let surrounding_entities: [RawEntity]?
+        let surround_entities_3d: [RawEntity]?
+    }
+
+    static func normalizeAgeMs(_ rawAgeMs: Int?, fallback: Int = 15) -> Int {
+        guard let rawAgeMs else { return fallback }
+        return rawAgeMs <= 0 ? fallback : max(1, rawAgeMs)
+    }
+
+    static func parse(
+        data: Data,
+        defaultOnline: Bool,
+        operationId: String
+    ) -> Insta360SceneGraphSnapshot {
+        let decoder = JSONDecoder()
+        let document: RawDocument
+        do {
+            document = try decoder.decode(RawDocument.self, from: data)
+        } catch {
+            TraceLogger.warn(
+                operationId: operationId,
+                component: "Insta360SceneGraphParser",
+                message: "Failed to decode insta360_surround_scene_graph.json",
+                error: error
+            )
+            return Insta360SceneGraphSnapshot(
+                online: defaultOnline,
+                frames: 42665,
+                ageMs: 15,
+                zClearanceMm: 86.5
+            )
+        }
+
+        let statusMeta = document.status_meta ?? document.status
+        let online = statusMeta?.running ?? defaultOnline
+        let rawFrames = statusMeta?.frames ?? 0
+        let frames = rawFrames > 0 ? rawFrames : 42665
+        let ageMs = normalizeAgeMs(statusMeta?.lastFrameAgeMs, fallback: 15)
+
+        let entities = document.surrounding_entities ?? document.surround_entities_3d ?? []
+        let matchedLeftArm = entities.first {
+            $0.resolvedId == "unitree_d1_arm_1_left" || $0.resolvedId == "d1_arm1_left"
+        }
+        let zClearanceMm = matchedLeftArm?.z_clearance_mm ?? 86.5
+
+        return Insta360SceneGraphSnapshot(
+            online: online,
+            frames: frames,
+            ageMs: ageMs,
+            zClearanceMm: zClearanceMm
+        )
+    }
+}
+
 enum Settings {
     private static let d = UserDefaults.standard
 
@@ -160,7 +296,8 @@ enum ScreenshotInbox {
     }
 
     static func apply() {
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let opId = TraceLogger.makeOperationId(prefix: "inbox")
+        FileIO.ensureDirectory(folder, operationId: opId, context: "ScreenshotInbox.apply")
         if !isApplied {
             // A Tendedero that is no longer running can leave screenshots pointed at its own
             // hidden folder. That is not the user's own setting, so it is never what we restore.
@@ -199,7 +336,8 @@ final class ScreenshotWatcher {
 
     func start() {
         guard source == nil else { return }
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let opId = TraceLogger.makeOperationId(prefix: "watch")
+        FileIO.ensureDirectory(folder, operationId: opId, context: "ScreenshotWatcher.start")
         known = Set(list().map { $0.lastPathComponent })
         let fd = open(folder.path, O_EVTONLY)
         guard fd >= 0 else { return }
@@ -217,9 +355,22 @@ final class ScreenshotWatcher {
 
     private func list() -> [URL] {
         let fm = FileManager.default
-        let urls = (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.creationDateKey],
-                                                 options: [.skipsHiddenFiles])) ?? []
-        return urls.filter { Self.mediaExtensions.contains($0.pathExtension.lowercased()) }
+        do {
+            let urls = try fm.contentsOfDirectory(
+                at: folder,
+                includingPropertiesForKeys: [.creationDateKey],
+                options: [.skipsHiddenFiles]
+            )
+            return urls.filter { Self.mediaExtensions.contains($0.pathExtension.lowercased()) }
+        } catch {
+            TraceLogger.warn(
+                operationId: TraceLogger.makeOperationId(prefix: "watch"),
+                component: "ScreenshotWatcher",
+                message: "contentsOfDirectory failed for \(folder.path)",
+                error: error
+            )
+            return []
+        }
     }
 
     private func scheduleScan() {
@@ -230,8 +381,12 @@ final class ScreenshotWatcher {
     }
 
     private func scan() {
-        func created(_ u: URL) -> Date {
-            (try? u.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+        func created(_ fileUrl: URL) -> Date {
+            do {
+                return try fileUrl.resourceValues(forKeys: [.creationDateKey]).creationDate ?? .distantPast
+            } catch {
+                return .distantPast
+            }
         }
         for url in list().sorted(by: { created($0) < created($1) }) where !known.contains(url.lastPathComponent) {
             known.insert(url.lastPathComponent)
@@ -273,9 +428,14 @@ func makeThumbnail(_ url: URL) -> CGImage? {
 
 func shotSpec(_ url: URL, thumb: CGImage) -> FeedSpec {
     let aspect = min(2.2, max(0.6, CGFloat(thumb.width) / CGFloat(max(1, thumb.height))))
-    let date = (try? url.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date()
+    let creationDate: Date
+    do {
+        creationDate = try url.resourceValues(forKeys: [.creationDateKey]).creationDate ?? Date()
+    } catch {
+        creationDate = Date()
+    }
     let rec = isRecordingFile(url)
-    return FeedSpec(id: "shot:" + url.path, title: (rec ? "录屏 " : "截图 ") + shotTimeFormatter.string(from: date),
+    return FeedSpec(id: "shot:" + url.path, title: (rec ? "录屏 " : "截图 ") + shotTimeFormatter.string(from: creationDate),
                     crop: nil, armKey: nil, ip: nil, accent: NSColor(white: 0.85, alpha: 1),
                     fileURL: url, fixedAspect: aspect, isRecording: rec)
 }
@@ -286,11 +446,20 @@ private func loadLocalStreamConfig(_ key: String, fallback: String) -> String {
     if let v = ProcessInfo.processInfo.environment[key], !v.isEmpty { return v }
     let cfgFile = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".config/d1_clothesline/\(key)")
-    if let s = try? String(contentsOf: cfgFile, encoding: .utf8)
-        .trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
-        return s
+    guard FileManager.default.fileExists(atPath: cfgFile.path) else { return fallback }
+    do {
+        let content = try String(contentsOf: cfgFile, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return content.isEmpty ? fallback : content
+    } catch {
+        TraceLogger.warn(
+            operationId: TraceLogger.makeOperationId(prefix: "cfg"),
+            component: "StreamConfig",
+            message: "Failed reading \(cfgFile.path)",
+            error: error
+        )
+        return fallback
     }
-    return fallback
 }
 
 final class FrameHub {
@@ -372,6 +541,7 @@ final class FrameHub {
     }
 
     private func runOnce() {
+        let operationId = TraceLogger.makeOperationId(prefix: "rtsp")
         let useHD = hd
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: ffmpegPath())
@@ -386,9 +556,30 @@ final class FrameHub {
         proc.standardOutput = pipe
         proc.standardError = FileHandle.nullDevice
         let handle = pipe.fileHandleForReading
-        defer { try? handle.close() }
+        defer {
+            do {
+                try handle.close()
+            } catch {
+                TraceLogger.warn(
+                    operationId: operationId,
+                    component: "FrameHub",
+                    message: "Closing ffmpeg stdout pipe failed",
+                    error: error
+                )
+            }
+        }
 
-        do { try proc.run() } catch { return }
+        do {
+            try proc.run()
+        } catch {
+            TraceLogger.warn(
+                operationId: operationId,
+                component: "FrameHub",
+                message: "Failed to launch ffmpeg process",
+                error: error
+            )
+            return
+        }
         proc.launchDate = Date()
         lock.lock(); process = proc; lock.unlock()
 
@@ -492,6 +683,7 @@ final class Telemetry {
         let session = URLSession(configuration: cfg)
         defer { session.finishTasksAndInvalidate() }
         let statusURL = URL(string: "\(hubURL)/api/status")
+        let decoder = JSONDecoder()
         var tick = 0
         while isRunning {
             for spec in allFeeds {
@@ -499,14 +691,25 @@ final class Telemetry {
                 lock.lock(); jointsByArm[key] = j; seen[key] = Date(); lock.unlock()
             }
             if tick % 3 == 0, let url = statusURL {
-                session.dataTask(with: url) { [weak self] data, _, err in
-                    guard let self, err == nil, let data,
-                          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+                session.dataTask(with: url) { [weak self] payloadData, _, err in
+                    guard let self, err == nil, let payloadData else { return }
+                    let decoded: HubStatusPayload
+                    do {
+                        decoded = try decoder.decode(HubStatusPayload.self, from: payloadData)
+                    } catch {
+                        TraceLogger.warn(
+                            operationId: TraceLogger.makeOperationId(prefix: "hub"),
+                            component: "Telemetry",
+                            message: "Failed decoding \(url.absoluteString)",
+                            error: error
+                        )
+                        return
+                    }
                     self.lock.lock()
-                    if let v = obj["continuous_mode"] as? Bool { self.hub.continuous = v }
-                    if let v = obj["cycle_count"] as? Int { self.hub.cycle = v }
-                    if let v = obj["current_skill"] as? String { self.hub.skill = v }
-                    if let v = obj["current_phase"] as? String { self.hub.phase = v }
+                    if let continuous = decoded.continuous_mode { self.hub.continuous = continuous }
+                    if let cycle = decoded.cycle_count { self.hub.cycle = cycle }
+                    if let skill = decoded.current_skill { self.hub.skill = skill }
+                    if let phase = decoded.current_phase { self.hub.phase = phase }
                     self.hubSeen = Date()
                     self.lock.unlock()
                 }.resume()
@@ -626,11 +829,12 @@ final class Insta360Hub {
 
     private func runBridgeCapture() {
         guard FileManager.default.isExecutableFile(atPath: Paths.pythonBin.path) else { return }
+        let operationId = TraceLogger.makeOperationId(prefix: "i360cap")
         let proc = Process()
         proc.executableURL = Paths.pythonBin
         proc.arguments = [
             "-c",
-            "from rsi.sim.insta360_perception_bridge import Insta360SideViewBridge; Insta360SideViewBridge('/Users/zhang/Documents/RSI').probe_and_capture_frame()"
+            "from rsi.sim.insta360_perception_bridge import Insta360SideViewBridge; Insta360SideViewBridge('/Users/zhang/Documents/RSI').probe_and_capture_frame(operation_id='\(operationId)')"
         ]
         proc.currentDirectoryURL = URL(fileURLWithPath: "/Users/zhang/Documents/RSI")
         proc.standardInput = FileHandle.nullDevice
@@ -643,57 +847,75 @@ final class Insta360Hub {
                 Thread.sleep(forTimeInterval: 0.15)
             }
             if proc.isRunning { proc.terminate() }
-        } catch {}
+        } catch {
+            TraceLogger.warn(
+                operationId: operationId,
+                component: "Insta360Hub",
+                message: "Failed launching python Insta360SideViewBridge subprocess",
+                error: error
+            )
+        }
     }
 
     private func reloadLocalFiles() {
-        let map: [(String, String)] = [
+        let operationId = TraceLogger.makeOperationId(prefix: "i360load")
+        let assetMap: [(String, String)] = [
             ("pano", "insta360_workbench_centered_360.jpg"),
             ("rect_workbench", "insta360_rectilinear_d1_workbench.jpg"),
         ]
-        var loaded: [String: CGImage] = [:]
-        for (key, filename) in map {
-            let url = Paths.insta360Dir.appendingPathComponent(filename)
-            if let data = try? Data(contentsOf: url),
-               let src = CGImageSourceCreateWithData(data as CFData, nil),
-               let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) {
-                loaded[key] = cg
+        var loadedImages: [String: CGImage] = [:]
+        for (feedKey, filename) in assetMap {
+            let fileUrl = Paths.insta360Dir.appendingPathComponent(filename)
+            guard FileManager.default.fileExists(atPath: fileUrl.path) else { continue }
+            do {
+                let rawBytes = try Data(contentsOf: fileUrl)
+                if let imageSource = CGImageSourceCreateWithData(rawBytes as CFData, nil),
+                   let cgImage = CGImageSourceCreateImageAtIndex(imageSource, 0, nil) {
+                    loadedImages[feedKey] = cgImage
+                }
+            } catch {
+                TraceLogger.warn(
+                    operationId: operationId,
+                    component: "Insta360Hub",
+                    message: "Failed reading Insta360 image \(fileUrl.path)",
+                    error: error
+                )
             }
         }
 
-        var online = !loaded.isEmpty
-        var frames = 42665
-        var ageMs = 15
-        var zClearance = 86.5
+        let defaultOnline = !loadedImages.isEmpty
+        var parsedSnapshot = Insta360SceneGraphSnapshot(
+            online: defaultOnline,
+            frames: 42665,
+            ageMs: 15,
+            zClearanceMm: 86.5
+        )
 
         let graphURL = Paths.insta360Dir.appendingPathComponent("insta360_surround_scene_graph.json")
-        if let data = try? Data(contentsOf: graphURL),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            let st = (obj["status_meta"] as? [String: Any]) ?? (obj["status"] as? [String: Any])
-            if let st {
-                if let f = st["frames"] as? Int, f > 0 { frames = f }
-                if let a = st["lastFrameAgeMs"] as? Int { ageMs = max(1, a <= 0 ? 15 : a) }
-                if let r = st["running"] as? Bool { online = r }
-            }
-            let entities = (obj["surrounding_entities"] as? [[String: Any]])
-                ?? (obj["surround_entities_3d"] as? [[String: Any]])
-            if let entities {
-                for ent in entities {
-                    let id = (ent["entity_id"] as? String) ?? (ent["id"] as? String) ?? ""
-                    if (id == "unitree_d1_arm_1_left" || id == "d1_arm1_left"),
-                       let z = ent["z_clearance_mm"] as? Double {
-                        zClearance = z
-                    }
-                }
+        if FileManager.default.fileExists(atPath: graphURL.path) {
+            do {
+                let rawGraphData = try Data(contentsOf: graphURL)
+                parsedSnapshot = Insta360SceneGraphParser.parse(
+                    data: rawGraphData,
+                    defaultOnline: defaultOnline,
+                    operationId: operationId
+                )
+            } catch {
+                TraceLogger.warn(
+                    operationId: operationId,
+                    component: "Insta360Hub",
+                    message: "Failed reading \(graphURL.path)",
+                    error: error
+                )
             }
         }
 
         lock.lock()
-        for (k, v) in loaded { images[k] = v }
-        _online = online
-        _frames = frames
-        _ageMs = ageMs
-        _zClearanceMm = zClearance
+        for (feedKey, image) in loadedImages { images[feedKey] = image }
+        _online = parsedSnapshot.online
+        _frames = parsedSnapshot.frames
+        _ageMs = parsedSnapshot.ageMs
+        _zClearanceMm = parsedSnapshot.zClearanceMm
         lock.unlock()
     }
 }
@@ -1580,6 +1802,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     var mouseTimer: Timer?
     var breezeTimer: Timer?
     var clickMonitors: [Any] = []
+    var mouseMoveMonitors: [Any] = []
+    var activityToken: NSObjectProtocol?
+    var hoverWakeupWorkItem: DispatchWorkItem?
+    var tuckOrderOutWorkItem: DispatchWorkItem?
 
     var isRevealed = false
     var hotZoneSince: Date?
@@ -1607,7 +1833,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        try? FileManager.default.createDirectory(at: Paths.snapshots, withIntermediateDirectories: true)
+        let launchOpId = TraceLogger.makeOperationId(prefix: "launch")
+        FileIO.ensureDirectory(Paths.snapshots, operationId: launchOpId, context: "applicationDidFinishLaunching")
+
+        // Prevent macOS App Nap from coalescing/throttling our 30Hz hover timer when panel is tucked (orderOut).
+        activityToken = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
+            reason: "MacBook Notch (灵动岛/刘海) and top menu bar low-latency hover tracking"
+        )
 
         lineView = ClotheslineView(frame: .zero)
         panel = LinePanel(content: lineView)
@@ -1660,6 +1893,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         }
 
         startTick()
+        watchMouseMovement()
         watchMenuBarClicks()
         scheduleBreeze()
         hotKey = HotKey(keyCode: UInt32(kVK_ANSI_D), modifiers: UInt32(controlKey | optionKey)) { [weak self] in
@@ -1685,8 +1919,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                     if let z = self.zooms[card.spec.id], let cv = z.contentView,
                        let rep = cv.bitmapImageRepForCachingDisplay(in: cv.bounds) {
                         cv.cacheDisplay(in: cv.bounds, to: rep)
-                        try? rep.representation(using: .png, properties: [:])?
-                            .write(to: Paths.snapshots.appendingPathComponent("d1_clothesline_zoom_latest.png"))
+                        if let pngBytes = rep.representation(using: .png, properties: [:]) {
+                            FileIO.writeData(
+                                pngBytes,
+                                to: Paths.snapshots.appendingPathComponent("d1_clothesline_zoom_latest.png"),
+                                operationId: TraceLogger.makeOperationId(prefix: "snap"),
+                                context: "zoomSnapshot"
+                            )
+                        }
                         z.close()
                     }
                 }
@@ -1708,8 +1948,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         mouseTimer = nil
         breezeTimer?.invalidate()
         breezeTimer = nil
+        hoverWakeupWorkItem?.cancel()
+        hoverWakeupWorkItem = nil
+        tuckOrderOutWorkItem?.cancel()
+        tuckOrderOutWorkItem = nil
         for m in clickMonitors { NSEvent.removeMonitor(m) }
         clickMonitors.removeAll()
+        for m in mouseMoveMonitors { NSEvent.removeMonitor(m) }
+        mouseMoveMonitors.removeAll()
+        if let token = activityToken {
+            ProcessInfo.processInfo.endActivity(token)
+            activityToken = nil
+        }
         watcher.stop()
         ScreenshotInbox.restore()
         frames.stop()
@@ -1856,8 +2106,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         m.addItem(ClosureMenuItem("存到桌面") {
             let desk = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop")
             let dest = desk.appendingPathComponent(url.lastPathComponent)
-            try? FileManager.default.copyItem(at: url, to: dest)
-            NSWorkspace.shared.activateFileViewerSelecting([dest])
+            do {
+                try FileManager.default.copyItem(at: url, to: dest)
+                NSWorkspace.shared.activateFileViewerSelecting([dest])
+            } catch {
+                TraceLogger.warn(
+                    operationId: TraceLogger.makeOperationId(prefix: "shot"),
+                    component: "ShotMenu",
+                    message: "Failed copying screenshot to Desktop: \(dest.path)",
+                    error: error
+                )
+            }
         })
         m.addItem(.separator())
         m.addItem(ClosureMenuItem("从晾衣绳上取下（文件保留）") { [weak self] in self?.letGo(card, trash: false) })
@@ -2010,6 +2269,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     func reveal(peek: TimeInterval = 0) {
         if peek > 0 { peekUntil = Date().addingTimeInterval(peek) }
         awaySince = nil
+        tuckOrderOutWorkItem?.cancel()
+        tuckOrderOutWorkItem = nil
+        hoverWakeupWorkItem?.cancel()
+        hoverWakeupWorkItem = nil
+        if isRevealed, let w = panel, !w.isVisible {
+            w.orderFrontRegardless()
+            lineView?.setRevealed(true, animated: false)
+            return
+        }
         guard !isRevealed else { return }
         isRevealed = true
         panel?.orderFrontRegardless()
@@ -2027,13 +2295,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         isRevealed = false
         peekUntil = .distantPast
         heldUntilEnter = false
+        hoverWakeupWorkItem?.cancel()
+        hoverWakeupWorkItem = nil
+        tuckOrderOutWorkItem?.cancel()
         panel?.ignoresMouseEvents = true
         lineView?.setHovered(nil)
         lineView?.setRevealed(false, animated: true)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            guard let self, !self.isRevealed else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.tuckOrderOutWorkItem = nil
+            guard !self.isRevealed else { return }
             self.panel?.orderOut(nil)
         }
+        tuckOrderOutWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
     }
 
     @objc func toggleLine() {
@@ -2068,12 +2343,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     func startTick() {
         let t = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in self?.tick() }
+        t.tolerance = 0.005
         RunLoop.main.add(t, forMode: .common)
         mouseTimer = t
     }
 
     func tick() {
         pollMouse()
+    }
+
+    /// Global & local mouse-move monitors ensure instant response even if the cursor stops
+    /// right after hitting the Notch (灵动岛/刘海) or top screen edge.
+    func watchMouseMovement() {
+        let handler: (NSEvent) -> Void = { [weak self] _ in
+            guard let self else { return }
+            self.pollMouse()
+        }
+        if let globalMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged],
+            handler: handler
+        ) {
+            mouseMoveMonitors.append(globalMonitor)
+        }
+        if let localMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged],
+            handler: { event in
+                handler(event)
+                return event
+            }
+        ) {
+            mouseMoveMonitors.append(localMonitor)
+        }
+    }
+
+    private func scheduleStationaryHoverWakeup(after delay: TimeInterval) {
+        hoverWakeupWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.hoverWakeupWorkItem = nil
+            self.pollMouse()
+        }
+        hoverWakeupWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     /// Evaluates mouse position against the MacBook Notch (灵动岛/刘海), menu bar, and open clothesline panel.
@@ -2084,6 +2395,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         metricsOverride: TopHoverGeometry.ScreenMetrics? = nil,
         pressedButtons: Int = NSEvent.pressedMouseButtons
     ) {
+        // Reconcile state if macOS WindowServer hid the panel while isRevealed was true.
+        if isRevealed, metricsOverride == nil, let w = panel, !w.isVisible, tuckOrderOutWorkItem == nil {
+            isRevealed = false
+        }
+
         let screen = overrideScreen ?? LinePanel.screenContaining(mouse)
         let metrics = metricsOverride ?? screen.map { TopHoverGeometry.ScreenMetrics(screen: $0) }
         let inNotch = metrics.map { TopHoverGeometry.isInNotchZone(mouse, metrics: $0) } ?? false
@@ -2112,6 +2428,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             }
             // Rest the pointer in the Notch (灵动岛/刘海) or menu bar and the line glides down on that screen.
             if Settings.hoverReveal, inTrigger, !menuBarSuppressed, pressedButtons == 0, let metrics {
+                let isFirstSampleInHotZone = (hotZoneSince == nil)
                 let since = hotZoneSince ?? now
                 hotZoneSince = since
                 lastHotZoneAt = now
@@ -2122,12 +2439,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                     lastHotZoneAt = nil
                     if let screen { panel?.placeOnScreen(screen) }
                     reveal()
+                } else if isFirstSampleInHotZone && metricsOverride == nil {
+                    scheduleStationaryHoverWakeup(after: delay + 0.01)
                 }
             } else if let last = lastHotZoneAt, now.timeIntervalSince(last) <= 0.12 {
                 // Brief 120ms hysteresis so a 1-frame cursor jitter at the Notch boundary does not reset hotZoneSince.
             } else {
                 hotZoneSince = nil
                 lastHotZoneAt = nil
+                hoverWakeupWorkItem?.cancel()
+                hoverWakeupWorkItem = nil
             }
             return
         }
@@ -2280,7 +2601,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     func writeSnapshot(spec: FeedSpec) -> URL? {
         guard let data = pngData(for: spec) else { return nil }
         let url = Paths.snapshots.appendingPathComponent("d1_\(spec.id)_\(timestamp()).png")
-        do { try data.write(to: url) } catch { return nil }
+        let opId = TraceLogger.makeOperationId(prefix: "snap")
+        guard FileIO.writeData(data, to: url, operationId: opId, context: "writeSnapshot(\(spec.id))") else {
+            return nil
+        }
         return url
     }
 
@@ -2410,13 +2734,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
             p.arguments = ["-i", url.path]
-            try? p.run()
+            do {
+                try p.run()
+            } catch {
+                TraceLogger.warn(
+                    operationId: TraceLogger.makeOperationId(prefix: "sc"),
+                    component: "Menu",
+                    message: "Failed launching /usr/sbin/screencapture",
+                    error: error
+                )
+            }
         })
         if !shots.isEmpty {
             menu.addItem(ClosureMenuItem("收下所有截图（\(shots.count) 张，文件保留）") { [weak self] in self?.clearShots() })
         }
         menu.addItem(ClosureMenuItem("打开屏幕截图文件夹") {
-            try? FileManager.default.createDirectory(at: ScreenshotInbox.folder, withIntermediateDirectories: true)
+            FileIO.ensureDirectory(
+                ScreenshotInbox.folder,
+                operationId: TraceLogger.makeOperationId(prefix: "menu"),
+                context: "openScreenshotFolder"
+            )
             NSWorkspace.shared.open(ScreenshotInbox.folder)
         })
         menu.addItem(.separator())
@@ -2499,7 +2836,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         root.render(in: ctx)
         guard let img = ctx.makeImage(),
               let png = NSBitmapImageRep(cgImage: img).representation(using: .png, properties: [:]) else { return }
-        try? png.write(to: Paths.snapshots.appendingPathComponent("d1_clothesline_latest.png"))
+        FileIO.writeData(
+            png,
+            to: Paths.snapshots.appendingPathComponent("d1_clothesline_latest.png"),
+            operationId: TraceLogger.makeOperationId(prefix: "dbg"),
+            context: "exportDebugSnapshot"
+        )
     }
 }
 
@@ -2641,7 +2983,14 @@ func runSelfTests() -> Int32 {
     d.pollMouse(at: NSPoint(x: 864, y: 1083.0), now: t2.addingTimeInterval(0.30), metricsOverride: mbp16, pressedButtons: 1)
     check(!d.isRevealed, "Mouse button pressed (window drag) does not trigger hover reveal")
 
-    // (h) Non-Notch external display & auto-hiding menu bar & degenerate zero rect edge cases
+    // (h) Rapid tuck() followed by reveal() cancels pending tuckOrderOutWorkItem
+    d.reveal()
+    d.tuck()
+    check(d.tuckOrderOutWorkItem != nil, "tuck() schedules cancellable tuckOrderOutWorkItem")
+    d.reveal()
+    check(d.tuckOrderOutWorkItem == nil && d.isRevealed, "reveal() immediately cancels pending tuckOrderOutWorkItem")
+
+    // (i) Non-Notch external display & auto-hiding menu bar & degenerate zero rect edge cases
     let extDisplay = TopHoverGeometry.ScreenMetrics(
         frame: NSRect(x: 0, y: 0, width: 2560, height: 1440),
         visibleFrame: NSRect(x: 0, y: 0, width: 2560, height: 1440), // auto-hiding menu bar
@@ -2656,6 +3005,27 @@ func runSelfTests() -> Int32 {
           "External display top-center Dynamic Island zone (1280, 1410.0) hits notchHotZone")
     check(!TopHoverGeometry.pointInRectInclusive(NSPoint(x: 0, y: 0), .zero),
           "Degenerate zero-width rect returns false without crashing")
+
+    // (j) Pure Insta360SceneGraphParser unit tests (valid payload + malformed JSON fallback)
+    let validJson = """
+    {
+      "status_meta": {"running": true, "frames": 98765, "lastFrameAgeMs": -2},
+      "surrounding_entities": [
+        {"entity_id": "unitree_d1_arm_1_left", "z_clearance_mm": 91.25}
+      ]
+    }
+    """.data(using: .utf8)!
+    let parsedValid = Insta360SceneGraphParser.parse(data: validJson, defaultOnline: false, operationId: "test-valid")
+    check(
+        parsedValid == Insta360SceneGraphSnapshot(online: true, frames: 98765, ageMs: 15, zClearanceMm: 91.25),
+        "Insta360SceneGraphParser decodes status_meta and normalizes negative ageMs to 15"
+    )
+    let malformedJson = Data("{broken".utf8)
+    let parsedFallback = Insta360SceneGraphParser.parse(data: malformedJson, defaultOnline: true, operationId: "test-bad")
+    check(
+        parsedFallback == Insta360SceneGraphSnapshot(online: true, frames: 42665, ageMs: 15, zClearanceMm: 86.5),
+        "Insta360SceneGraphParser falls back cleanly on malformed JSON"
+    )
 
     print("Self-test summary: \(failures.isEmpty ? "ALL PASSED" : "\(failures.count) FAILED")")
     return failures.isEmpty ? 0 : 1
