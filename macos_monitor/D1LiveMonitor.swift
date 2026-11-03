@@ -34,9 +34,14 @@ enum FileIO {
     }
 
     @discardableResult
-    static func writeData(_ data: Data, to url: URL, operationId: String, context: String) -> Bool {
+    static func writeData(
+        _ payloadBytes: Data,
+        to url: URL,
+        operationId: String,
+        context: String
+    ) -> Bool {
         do {
-            try data.write(to: url, options: .atomic)
+            try payloadBytes.write(to: url, options: .atomic)
             return true
         } catch {
             TraceLogger.warn(
@@ -133,14 +138,14 @@ struct Insta360SceneGraphParser {
     }
 
     static func parse(
-        data: Data,
+        jsonData: Data,
         defaultOnline: Bool,
         operationId: String
     ) -> Insta360SceneGraphSnapshot {
         let decoder = JSONDecoder()
         let document: RawDocument
         do {
-            document = try decoder.decode(RawDocument.self, from: data)
+            document = try decoder.decode(RawDocument.self, from: jsonData)
         } catch {
             TraceLogger.warn(
                 operationId: operationId,
@@ -893,7 +898,7 @@ final class LiveStreamController {
             do {
                 let rawGraphData = try Data(contentsOf: graphURL)
                 parsedSnapshot = Insta360SceneGraphParser.parse(
-                    data: rawGraphData,
+                    jsonData: rawGraphData,
                     defaultOnline: defaultOnline,
                     operationId: operationId
                 )
@@ -936,15 +941,23 @@ final class LiveStreamController {
             if currentMode != .hubHTTP { break }
 
             let sem = DispatchSemaphore(value: 0)
-            let task = session.dataTask(with: snapURL) { [weak self] data, resp, err in
+            let task = session.dataTask(with: snapURL) { [weak self] responseBytes, resp, err in
                 defer { sem.signal() }
+                if let err {
+                    TraceLogger.warn(
+                        operationId: TraceLogger.makeOperationId(prefix: "hubsnap"),
+                        component: "LiveStreamController",
+                        message: "Hub snapshot request failed",
+                        error: err
+                    )
+                    return
+                }
                 guard let self = self,
-                      err == nil,
                       let http = resp as? HTTPURLResponse,
                       http.statusCode == 200,
-                      let data = data,
-                      data.count > 2000,
-                      let img = NSImage(data: data) else {
+                      let responseBytes = responseBytes,
+                      responseBytes.count > 2000,
+                      let img = NSImage(data: responseBytes) else {
                     return
                 }
                 self.deliverFrame(img)
@@ -1037,7 +1050,7 @@ final class LiveStreamController {
             }
             buffer.append(chunk)
 
-            // Extract all complete JPEG frames in buffer, render the freshest one
+            // 丢弃堆积旧帧仅渲染最新完整帧
             var latestJPEG: Data?
             while true {
                 guard let soiRange = buffer.range(of: soiMarker) else {
@@ -1096,7 +1109,6 @@ final class LiveStreamController {
 
         var tick = 0
         while isRunning {
-            // 1. Direct UDP query to 10.10.137.101..103:19001
             for key in ["left_103", "center_102", "right_101"] {
                 state.lock.lock()
                 let ip = state.arms[key]?.ip ?? ""
@@ -1113,7 +1125,7 @@ final class LiveStreamController {
                 }
             }
 
-            // 2. Every 3 ticks (~0.9s), sync skill/phase from 4gpu:8899 if reachable
+            // 降频轮询远端中控降低开销
             if tick % 3 == 0, let url = statusURL {
                 let task = session.dataTask(with: url) { [weak self] payloadData, _, err in
                     guard let self = self,
@@ -1657,7 +1669,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// MARK: - Automated Self-Test (--self-test)
+// MARK: - Automated Self-Test
 
 func runSelfTests() -> Int32 {
     var failures: [String] = []
@@ -1678,7 +1690,7 @@ func runSelfTests() -> Int32 {
       ]
     }
     """.data(using: .utf8)!
-    let parsed = Insta360SceneGraphParser.parse(data: validGraphJson, defaultOnline: false, operationId: "mon-test-1")
+    let parsed = Insta360SceneGraphParser.parse(jsonData: validGraphJson, defaultOnline: false, operationId: "mon-test-1")
     check(
         parsed == Insta360SceneGraphSnapshot(online: true, frames: 54321, ageMs: 15, zClearanceMm: 88.4),
         "Insta360SceneGraphParser decodes surround_entities_3d and normalizes zero ageMs to 15"

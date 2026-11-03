@@ -58,9 +58,14 @@ enum FileIO {
     }
 
     @discardableResult
-    static func writeData(_ data: Data, to url: URL, operationId: String, context: String) -> Bool {
+    static func writeData(
+        _ payloadBytes: Data,
+        to url: URL,
+        operationId: String,
+        context: String
+    ) -> Bool {
         do {
-            try data.write(to: url, options: .atomic)
+            try payloadBytes.write(to: url, options: .atomic)
             return true
         } catch {
             TraceLogger.warn(
@@ -74,7 +79,7 @@ enum FileIO {
     }
 }
 
-// MARK: - Typed Telemetry & Scene Graph Parsers (Pure Functions)
+// MARK: - Typed Telemetry & Scene Graph Parsers
 
 struct HubStatusPayload: Decodable {
     let continuous_mode: Bool?
@@ -118,14 +123,14 @@ struct Insta360SceneGraphParser {
     }
 
     static func parse(
-        data: Data,
+        jsonData: Data,
         defaultOnline: Bool,
         operationId: String
     ) -> Insta360SceneGraphSnapshot {
         let decoder = JSONDecoder()
         let document: RawDocument
         do {
-            document = try decoder.decode(RawDocument.self, from: data)
+            document = try decoder.decode(RawDocument.self, from: jsonData)
         } catch {
             TraceLogger.warn(
                 operationId: operationId,
@@ -228,18 +233,28 @@ struct FeedSpec {
     }
 }
 
-private func px(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat) -> CGRect {
-    CGRect(x: x / 2304.0, y: y / 1296.0, width: w / 2304.0, height: h / 1296.0)
+private func normalizedCropRect(
+    _ originX: CGFloat,
+    _ originY: CGFloat,
+    _ widthPx: CGFloat,
+    _ heightPx: CGFloat
+) -> CGRect {
+    CGRect(
+        x: originX / 2304.0,
+        y: originY / 1296.0,
+        width: widthPx / 2304.0,
+        height: heightPx / 1296.0
+    )
 }
 
 let allFeeds: [FeedSpec] = [
     FeedSpec(id: "overview", title: "全景俯视", crop: nil, armKey: nil, ip: nil,
              accent: NSColor(calibratedRed: 0.22, green: 0.74, blue: 0.97, alpha: 1)),
-    FeedSpec(id: "left_103", title: "左臂103", crop: px(140, 640, 840, 630), armKey: "left_103", ip: "10.10.137.103",
+    FeedSpec(id: "left_103", title: "左臂103", crop: normalizedCropRect(140, 640, 840, 630), armKey: "left_103", ip: "10.10.137.103",
              accent: NSColor(calibratedRed: 0.06, green: 0.73, blue: 0.51, alpha: 1)),
-    FeedSpec(id: "center_102", title: "中臂102", crop: px(690, 640, 840, 630), armKey: "center_102", ip: "10.10.137.102",
+    FeedSpec(id: "center_102", title: "中臂102", crop: normalizedCropRect(690, 640, 840, 630), armKey: "center_102", ip: "10.10.137.102",
              accent: NSColor(calibratedRed: 0.23, green: 0.51, blue: 0.96, alpha: 1)),
-    FeedSpec(id: "right_101", title: "右臂101", crop: px(1260, 600, 840, 630), armKey: "right_101", ip: "10.10.137.101",
+    FeedSpec(id: "right_101", title: "右臂101", crop: normalizedCropRect(1260, 600, 840, 630), armKey: "right_101", ip: "10.10.137.101",
              accent: NSColor(calibratedRed: 0.66, green: 0.33, blue: 0.97, alpha: 1)),
     FeedSpec(id: "insta360_pano", title: "Insta360全景", crop: nil, armKey: nil, ip: "10.10.137.106",
              accent: NSColor(calibratedRed: 1.00, green: 0.58, blue: 0.00, alpha: 1),
@@ -526,15 +541,18 @@ final class FrameHub {
         }
     }
 
+    private var processLaunchedAt = Date.distantPast
+
     /// ffmpeg can stall silently when the camera drops the session; kill it so the loop reconnects.
     private func watchdog() {
         while isRunning {
             Thread.sleep(forTimeInterval: 2.0)
             lock.lock()
             let p = process
+            let launchedAt = processLaunchedAt
             let stale = Date().timeIntervalSince(_lastFrameAt) > 6
             lock.unlock()
-            if let p, p.isRunning, stale, Date().timeIntervalSince(p.launchDate) > 8 {
+            if let p, p.isRunning, stale, Date().timeIntervalSince(launchedAt) > 8 {
                 p.terminate()
             }
         }
@@ -580,8 +598,10 @@ final class FrameHub {
             )
             return
         }
-        proc.launchDate = Date()
-        lock.lock(); process = proc; lock.unlock()
+        lock.lock()
+        processLaunchedAt = Date()
+        process = proc
+        lock.unlock()
 
         var buffer = Data()
         let soi = Data([0xFF, 0xD8])
@@ -618,14 +638,6 @@ final class FrameHub {
         }
         if proc.isRunning { proc.terminate() }
         lock.lock(); if process === proc { process = nil }; lock.unlock()
-    }
-}
-
-private var launchDateKey: UInt8 = 0
-extension Process {
-    var launchDate: Date {
-        get { (objc_getAssociatedObject(self, &launchDateKey) as? Date) ?? .distantPast }
-        set { objc_setAssociatedObject(self, &launchDateKey, newValue, .OBJC_ASSOCIATION_RETAIN) }
     }
 }
 
@@ -896,7 +908,7 @@ final class Insta360Hub {
             do {
                 let rawGraphData = try Data(contentsOf: graphURL)
                 parsedSnapshot = Insta360SceneGraphParser.parse(
-                    data: rawGraphData,
+                    jsonData: rawGraphData,
                     defaultOnline: defaultOnline,
                     operationId: operationId
                 )
@@ -921,7 +933,7 @@ final class Insta360Hub {
 }
 
 
-// MARK: - Layout (rope geometry, like tendedero)
+// MARK: - Layout
 
 enum Layout {
     static var scale: CGFloat { Settings.sizeScale }
@@ -936,11 +948,11 @@ enum Layout {
     /// The rope hangs as a parabola from edge to edge of the screen.
     static func sag(_ width: CGFloat) -> CGFloat { min(30, width * 0.018) }
 
-    /// Distance from the top of the panel down to the rope at `x`.
-    static func ropeDepth(x: CGFloat, width: CGFloat) -> CGFloat {
+    /// Distance from the top of the panel down to the rope at `horizontalX`.
+    static func ropeDepth(atX horizontalX: CGFloat, width: CGFloat) -> CGFloat {
         guard width > 0 else { return ropeTop }
-        let f = x / width
-        return ropeTop + 4 * sag(width) * f * (1 - f)
+        let normalizedRatio = horizontalX / width
+        return ropeTop + 4 * sag(width) * normalizedRatio * (1 - normalizedRatio)
     }
 }
 
@@ -1346,6 +1358,101 @@ struct TopHoverGeometry {
     }
 }
 
+typealias NotchHoverGeometry = TopHoverGeometry
+
+struct ClotheslineHoverState: Equatable {
+    var isRevealed: Bool = false
+    var hotZoneSince: Date? = nil
+    var lastHotZoneAt: Date? = nil
+    var awaySince: Date? = nil
+    var peekUntil: Date = .distantPast
+    var heldUntilEnter: Bool = false
+    var menuBarSuppressed: Bool = false
+    var suppressedAtPoint: NSPoint? = nil
+}
+
+enum ClotheslineHoverAction: Equatable {
+    case none
+    case reveal
+    case tuck
+    case scheduleStationaryWakeup(afterSeconds: TimeInterval)
+}
+
+struct ClotheslineHoverController {
+    static func evaluate(
+        state: inout ClotheslineHoverState,
+        mouse: NSPoint,
+        now: Date,
+        metrics: TopHoverGeometry.ScreenMetrics?,
+        panelFrame: NSRect,
+        pinned: Bool,
+        hoverRevealEnabled: Bool,
+        pressedButtons: Int,
+        isInteractionBusy: Bool
+    ) -> ClotheslineHoverAction {
+        let inNotch = metrics.map { TopHoverGeometry.isInNotchZone(mouse, metrics: $0) } ?? false
+        let inMenuBar = metrics.map { TopHoverGeometry.isInMenuBarBand(mouse, metrics: $0) } ?? false
+        let inTrigger = inNotch || inMenuBar
+
+        if !inTrigger || inNotch {
+            state.menuBarSuppressed = false
+            state.suppressedAtPoint = nil
+        } else if let origin = state.suppressedAtPoint,
+                  hypot(mouse.x - origin.x, mouse.y - origin.y) > 28.0 {
+            state.menuBarSuppressed = false
+            state.suppressedAtPoint = nil
+        }
+
+        guard state.isRevealed else {
+            if pinned {
+                return .reveal
+            }
+            if hoverRevealEnabled, inTrigger, !state.menuBarSuppressed, pressedButtons == 0, let metrics {
+                let since = state.hotZoneSince ?? now
+                state.hotZoneSince = since
+                state.lastHotZoneAt = now
+                let atTopEdge = mouse.y >= metrics.frame.maxY - 2.0
+                let requiredDelay: TimeInterval = (inNotch || atTopEdge) ? 0.08 : 0.18
+                let elapsed = now.timeIntervalSince(since)
+                if elapsed >= requiredDelay {
+                    state.hotZoneSince = nil
+                    state.lastHotZoneAt = nil
+                    return .reveal
+                }
+                let remaining = max(0.01, requiredDelay - elapsed + 0.005)
+                return .scheduleStationaryWakeup(afterSeconds: remaining)
+            }
+            if let lastSeen = state.lastHotZoneAt, now.timeIntervalSince(lastSeen) <= 0.12 {
+                // 防 1 帧抖动重置计时
+                return .none
+            }
+            state.hotZoneSince = nil
+            state.lastHotZoneAt = nil
+            return .none
+        }
+
+        let insideKeepOpen = metrics.map {
+            TopHoverGeometry.isInKeepOpenZone(mouse, panelFrame: panelFrame, metrics: $0)
+        } ?? inTrigger
+
+        if insideKeepOpen && state.heldUntilEnter {
+            state.heldUntilEnter = false
+        }
+        let keepOpenBusy = pinned || state.heldUntilEnter || isInteractionBusy || now < state.peekUntil
+        if insideKeepOpen || keepOpenBusy {
+            state.awaySince = nil
+            return .none
+        }
+        let since = state.awaySince ?? now
+        state.awaySince = since
+        if now.timeIntervalSince(since) >= 0.5 {
+            state.awaySince = nil
+            return .tuck
+        }
+        return .none
+    }
+}
+
 // MARK: - The strip under the menu bar
 
 final class LinePanel: NSPanel {
@@ -1502,8 +1609,8 @@ final class ClotheslineView: NSView, NSDraggingSource {
         let path = CGMutablePath()
         let steps = 96
         for s in 0...steps {
-            let x = W * CGFloat(s) / CGFloat(steps)
-            let p = CGPoint(x: x, y: H - Layout.ropeDepth(x: x, width: W))
+            let stepX = W * CGFloat(s) / CGFloat(steps)
+            let p = CGPoint(x: stepX, y: H - Layout.ropeDepth(atX: stepX, width: W))
             if s == 0 { path.move(to: p) } else { path.addLine(to: p) }
         }
         rope.frame = container.bounds
@@ -1513,27 +1620,27 @@ final class ClotheslineView: NSView, NSDraggingSource {
 
         let widths = cards.map { $0.width }
         let sumW = widths.reduce(0, +)
-        // A crowded line lets the cards overlap instead of running off the screen.
+        // 卡片过多时允许部分重叠防越界
         var gap = Layout.gap
         let avail = W - 60
         if cards.count > 1, sumW + gap * CGFloat(cards.count - 1) > avail {
             gap = (avail - sumW) / CGFloat(cards.count - 1)
         }
         let total = sumW + gap * CGFloat(max(0, cards.count - 1))
-        var x = (W - total) / 2
+        var cursorX = (W - total) / 2
         for (i, card) in cards.enumerated() {
             let w = widths[i]
-            let cx = x + w / 2
+            let cx = cursorX + w / 2
             card.layout()
-            // Anchor = top centre of the card; the clip's slot (3.5pt above the card) sits on the rope.
-            card.holder.position = CGPoint(x: cx, y: H - Layout.ropeDepth(x: cx, width: W) - 3.5)
+            // 锚点对齐挂绳底部槽位
+            card.holder.position = CGPoint(x: cx, y: H - Layout.ropeDepth(atX: cx, width: W) - 3.5)
             card.applyTransform(animated: false)
-            x += w + gap
+            cursorX += w + gap
         }
 
         hint.isHidden = !cards.isEmpty
         hint.contentsScale = backingScale
-        hint.frame = CGRect(x: 0, y: H - Layout.ropeDepth(x: W / 2, width: W) - 34, width: W, height: 18)
+        hint.frame = CGRect(x: 0, y: H - Layout.ropeDepth(atX: W / 2, width: W) - 34, width: W, height: 18)
         CATransaction.commit()
     }
 
@@ -1569,7 +1676,7 @@ final class ClotheslineView: NSView, NSDraggingSource {
     }
 
     func cardIndex(at p: NSPoint) -> Int? {
-        // The card under the pointer is drawn on top, so it wins where cards overlap.
+        // 优先命中当前悬停顶层卡片
         if let h = cards.firstIndex(where: { $0.hovered }),
            cards[h].holder.frame.insetBy(dx: -4, dy: -4).contains(p) { return h }
         for (i, c) in cards.enumerated().reversed() where c.holder.frame.insetBy(dx: -4, dy: -4).contains(p) {
@@ -1656,7 +1763,7 @@ final class ClotheslineView: NSView, NSDraggingSource {
     }
 }
 
-// MARK: - Pop-out live window (click a card)
+// MARK: - Pop-out live window
 
 final class LiveZoomView: NSView {
     let imageLayer = CALayer()
@@ -1713,9 +1820,9 @@ final class ZoomPanel: NSPanel {
         let h = (w / spec.aspect).rounded()
         let screen = NSScreen.screens.first { $0.frame.intersects(cardRect) } ?? NSScreen.main
         let vis = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let x = min(max(cardRect.midX - w / 2, vis.minX + 8), vis.maxX - w - 8)
-        let y = max(vis.minY + 8, cardRect.minY - h - 28)
-        let target = NSRect(x: x, y: y, width: w, height: h)
+        let originX = min(max(cardRect.midX - w / 2, vis.minX + 8), vis.maxX - w - 8)
+        let originY = max(vis.minY + 8, cardRect.minY - h - 28)
+        let target = NSRect(x: originX, y: originY, width: w, height: h)
 
         super.init(contentRect: target,
                    styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -1733,7 +1840,7 @@ final class ZoomPanel: NSPanel {
         minSize = NSSize(width: 240, height: 240 / spec.aspect)
         contentView = zoomView
 
-        // Pops out from the card it came from.
+        // 从对应卡片位置弹出过渡动画
         setFrame(cardRect, display: false)
         alphaValue = 0.4
         orderFrontRegardless()
@@ -1746,20 +1853,23 @@ final class ZoomPanel: NSPanel {
     }
 }
 
-// MARK: - Global hot key (⌃⌥D)
+// MARK: - Global hot key
 
 final class HotKey {
     private var hotKeyRef: EventHotKeyRef?
     private var handlerRef: EventHandlerRef?
-    fileprivate static var action: (() -> Void)?
+    fileprivate let onTrigger: () -> Void
 
     init?(keyCode: UInt32, modifiers: UInt32, action: @escaping () -> Void) {
-        HotKey.action = action
+        self.onTrigger = action
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        let s1 = InstallEventHandler(GetApplicationEventTarget(), { _, _, _ -> OSStatus in
-            DispatchQueue.main.async { HotKey.action?() }
+        let userData = Unmanaged.passUnretained(self).toOpaque()
+        let s1 = InstallEventHandler(GetApplicationEventTarget(), { _, _, rawUserData -> OSStatus in
+            guard let rawUserData else { return noErr }
+            let instance = Unmanaged<HotKey>.fromOpaque(rawUserData).takeUnretainedValue()
+            DispatchQueue.main.async { instance.onTrigger() }
             return noErr
-        }, 1, &spec, nil, &handlerRef)
+        }, 1, &spec, userData, &handlerRef)
         guard s1 == noErr else { return nil }
         let id = EventHotKeyID(signature: OSType(0x4431_4C4E), id: 1)
         let s2 = RegisterEventHotKey(keyCode, modifiers, id, GetApplicationEventTarget(), 0, &hotKeyRef)
@@ -1836,7 +1946,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         let launchOpId = TraceLogger.makeOperationId(prefix: "launch")
         FileIO.ensureDirectory(Paths.snapshots, operationId: launchOpId, context: "applicationDidFinishLaunching")
 
-        // Prevent macOS App Nap from coalescing/throttling our 30Hz hover timer when panel is tucked (orderOut).
+        // 防止 App Nap 降低悬停轮询频率
         activityToken = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
             reason: "MacBook Notch (灵动岛/刘海) and top menu bar low-latency hover tracking"
@@ -1889,7 +1999,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            self?.panel.placeOnScreen()
+            self?.handleScreenParametersChanged()
         }
 
         startTick()
@@ -1900,8 +2010,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             self?.toggleLine()
         }
 
-        // Briefly peek at launch for 2.8s, then automatically tuck into the menu bar / Notch
-        // so moving the pointer to the Notch or menu bar immediately slides the line down.
+        // 启动短暂预览后自动收起待命
         heldUntilEnter = false
         reveal(peek: 2.8)
 
@@ -1912,7 +2021,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) { [weak self] in
                 guard let self else { return }
                 self.exportDebugSnapshot()
-                // Exercise the click → pop-out path on the 中臂102 card, then close it again.
+                // 验证中臂卡片点击弹出与收起流程
                 guard let card = self.lineView.cards.first(where: { $0.spec.id == "center_102" }) else { return }
                 self.toggleZoom(card)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
@@ -1931,6 +2040,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                     }
                 }
             }
+        }
+    }
+
+    func handleScreenParametersChanged() {
+        let wasRevealed = isRevealed
+        panel?.placeOnScreen()
+        lineView?.relayout()
+        if !wasRevealed {
+            lineView?.setRevealed(false, animated: false)
         }
     }
 
@@ -2040,7 +2158,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     /// A new capture landed in the folder: hang it and bring the line down for a moment.
     func hangCapture(_ url: URL, attempt: Int) {
         guard let thumb = makeThumbnail(url) else {
-            // Still being written; try again shortly.
+            // 文件尚未落盘完成时延迟重试
             if attempt < 6 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                     self?.hangCapture(url, attempt: attempt + 1)
@@ -2052,7 +2170,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         guard !shots.contains(where: { $0.id == spec.id }) else { return }
         shots.append(spec)
         shotThumbs[spec.id] = thumb
-        // A full line lets the oldest capture go (the file stays in the folder).
+        // 超过挂绳上限时移除最早截图
         while shots.count > Settings.maxShots {
             let gone = shots.removeFirst()
             shotThumbs[gone.id] = nil
@@ -2133,7 +2251,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     // MARK: Frames & captions
 
     func handleFrame(_ img: CGImage) {
-        // Frames come out of the pipe in bursts, so count them over a 2s window.
+        // 2 秒滑窗平滑突发管道帧率
         let now = CACurrentMediaTime()
         frameTimes.append(now)
         while let first = frameTimes.first, now - first > 2.0 { frameTimes.removeFirst() }
@@ -2395,67 +2513,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         metricsOverride: TopHoverGeometry.ScreenMetrics? = nil,
         pressedButtons: Int = NSEvent.pressedMouseButtons
     ) {
-        // Reconcile state if macOS WindowServer hid the panel while isRevealed was true.
+        // 窗口被系统隐藏时同步状态
         if isRevealed, metricsOverride == nil, let w = panel, !w.isVisible, tuckOrderOutWorkItem == nil {
             isRevealed = false
         }
 
         let screen = overrideScreen ?? LinePanel.screenContaining(mouse)
         let metrics = metricsOverride ?? screen.map { TopHoverGeometry.ScreenMetrics(screen: $0) }
-        let inNotch = metrics.map { TopHoverGeometry.isInNotchZone(mouse, metrics: $0) } ?? false
-        let inMenuBar = metrics.map { TopHoverGeometry.isInMenuBarBand(mouse, metrics: $0) } ?? false
-        let inTrigger = inNotch || inMenuBar
-
-        // Clear suppression when leaving the top bar, entering the central Notch (no menus live in the Notch),
-        // or moving away from the menu item that was clicked.
-        if !inTrigger || inNotch {
-            menuBarSuppressed = false
-            suppressedAtPoint = nil
-        } else if let p0 = suppressedAtPoint, hypot(mouse.x - p0.x, mouse.y - p0.y) > 28.0 {
-            menuBarSuppressed = false
-            suppressedAtPoint = nil
-        }
-
-        let active = (panel?.isVisible ?? false) || !zooms.isEmpty
-        frames.needsFrames = active
-        insta360.needsFrames = active
-
-        guard isRevealed else {
-            if Settings.pinned {
-                panel?.placeOnScreen(screen)
-                reveal()
-                return
-            }
-            // Rest the pointer in the Notch (灵动岛/刘海) or menu bar and the line glides down on that screen.
-            if Settings.hoverReveal, inTrigger, !menuBarSuppressed, pressedButtons == 0, let metrics {
-                let isFirstSampleInHotZone = (hotZoneSince == nil)
-                let since = hotZoneSince ?? now
-                hotZoneSince = since
-                lastHotZoneAt = now
-                let atTopEdge = mouse.y >= metrics.frame.maxY - 2.0
-                let delay: TimeInterval = (inNotch || atTopEdge) ? 0.08 : 0.18
-                if now.timeIntervalSince(since) >= delay {
-                    hotZoneSince = nil
-                    lastHotZoneAt = nil
-                    if let screen { panel?.placeOnScreen(screen) }
-                    reveal()
-                } else if isFirstSampleInHotZone && metricsOverride == nil {
-                    scheduleStationaryHoverWakeup(after: delay + 0.01)
-                }
-            } else if let last = lastHotZoneAt, now.timeIntervalSince(last) <= 0.12 {
-                // Brief 120ms hysteresis so a 1-frame cursor jitter at the Notch boundary does not reset hotZoneSince.
-            } else {
-                hotZoneSince = nil
-                lastHotZoneAt = nil
-                hoverWakeupWorkItem?.cancel()
-                hoverWakeupWorkItem = nil
-            }
-            return
-        }
-
-        if panel != nil { updatePassThrough(mouse) }
-
-        // The line's keep-open zone runs from its lowest point up to the very top of the screen (including Notch).
         let activeMetrics = metricsOverride
             ?? (panel?.screen ?? screen ?? NSScreen.main).map { TopHoverGeometry.ScreenMetrics(screen: $0) }
         let pFrame = panel?.frame ?? NSRect(
@@ -2464,21 +2528,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             width: activeMetrics?.visibleFrame.width ?? 1728,
             height: Layout.panelHeight
         )
-        let inside = activeMetrics.map {
-            TopHoverGeometry.isInKeepOpenZone(mouse, panelFrame: pFrame, metrics: $0)
-        } ?? inTrigger
 
-        if inside && heldUntilEnter { heldUntilEnter = false }
-        let busy = Settings.pinned || heldUntilEnter || (lineView?.isDragging ?? false)
-            || (lineView?.isShowingMenu ?? false) || now < peekUntil
-        if inside || busy {
-            awaySince = nil
-        } else {
-            let since = awaySince ?? now
-            awaySince = since
-            if now.timeIntervalSince(since) >= 0.5 {
-                awaySince = nil
-                tuck()
+        let active = (panel?.isVisible ?? false) || !zooms.isEmpty
+        frames.needsFrames = active
+        insta360.needsFrames = active
+
+        if isRevealed, panel != nil {
+            updatePassThrough(mouse)
+        }
+
+        var hoverState = ClotheslineHoverState(
+            isRevealed: isRevealed,
+            hotZoneSince: hotZoneSince,
+            lastHotZoneAt: lastHotZoneAt,
+            awaySince: awaySince,
+            peekUntil: peekUntil,
+            heldUntilEnter: heldUntilEnter,
+            menuBarSuppressed: menuBarSuppressed,
+            suppressedAtPoint: suppressedAtPoint
+        )
+        let action = ClotheslineHoverController.evaluate(
+            state: &hoverState,
+            mouse: mouse,
+            now: now,
+            metrics: isRevealed ? activeMetrics : metrics,
+            panelFrame: pFrame,
+            pinned: Settings.pinned,
+            hoverRevealEnabled: Settings.hoverReveal,
+            pressedButtons: pressedButtons,
+            isInteractionBusy: (lineView?.isDragging ?? false) || (lineView?.isShowingMenu ?? false)
+        )
+        hotZoneSince = hoverState.hotZoneSince
+        lastHotZoneAt = hoverState.lastHotZoneAt
+        awaySince = hoverState.awaySince
+        heldUntilEnter = hoverState.heldUntilEnter
+        menuBarSuppressed = hoverState.menuBarSuppressed
+        suppressedAtPoint = hoverState.suppressedAtPoint
+
+        switch action {
+        case .reveal:
+            if let screen { panel?.placeOnScreen(screen) }
+            reveal()
+        case .tuck:
+            tuck()
+        case .scheduleStationaryWakeup(let waitSeconds):
+            if metricsOverride == nil {
+                scheduleStationaryHoverWakeup(after: waitSeconds)
+            }
+        case .none:
+            if !isRevealed && hotZoneSince == nil {
+                hoverWakeupWorkItem?.cancel()
+                hoverWakeupWorkItem = nil
             }
         }
     }
@@ -2599,10 +2699,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     @discardableResult
     func writeSnapshot(spec: FeedSpec) -> URL? {
-        guard let data = pngData(for: spec) else { return nil }
+        guard let pngBytes = pngData(for: spec) else { return nil }
         let url = Paths.snapshots.appendingPathComponent("d1_\(spec.id)_\(timestamp()).png")
         let opId = TraceLogger.makeOperationId(prefix: "snap")
-        guard FileIO.writeData(data, to: url, operationId: opId, context: "writeSnapshot(\(spec.id))") else {
+        guard FileIO.writeData(pngBytes, to: url, operationId: opId, context: "writeSnapshot(\(spec.id))") else {
             return nil
         }
         return url
@@ -2723,7 +2823,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         })
         menu.addItem(.separator())
 
-        // Screenshots
         menu.addItem(ClosureMenuItem("接管截图快捷键 ⌘⇧3 / ⌘⇧4 / ⌘⇧5",
                                      state: Settings.takeOverScreenshots ? .on : .off) { [weak self] in
             Settings.takeOverScreenshots.toggle()
@@ -2816,7 +2915,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         captureStampFormatter.string(from: Date())
     }
 
-    // MARK: Debug snapshot (renders the line over a sample backdrop)
+    // MARK: Debug snapshot
 
     func exportDebugSnapshot() {
         guard let root = lineView.layer else { return }
@@ -2845,7 +2944,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     }
 }
 
-// MARK: - Automated Self-Test (--self-test)
+// MARK: - Automated Self-Test
 
 func runSelfTests() -> Int32 {
     var failures: [String] = []
@@ -2858,7 +2957,6 @@ func runSelfTests() -> Int32 {
         }
     }
 
-    // 1. 16-inch MacBook Pro Notch screen metrics (1728×1117, visible maxY=1083, safeAreaTop=32, Notch x=771...956)
     let mbp16 = TopHoverGeometry.ScreenMetrics(
         frame: NSRect(x: 0, y: 0, width: 1728, height: 1117),
         visibleFrame: NSRect(x: 0, y: 50, width: 1728, height: 1033),
@@ -2871,33 +2969,29 @@ func runSelfTests() -> Int32 {
     let notch = TopHoverGeometry.notchRect(for: mbp16)
     check(notch.minX == 771 && notch.maxX == 956, "Notch X span matches auxiliaryTopLeft/Right (771...956)")
 
-    // Top pixel (y == frame.maxY = 1117.0) and subpixel overshoot (1117.5)
     check(TopHoverGeometry.isInNotchZone(NSPoint(x: 864, y: 1117.0), metrics: mbp16),
           "Cursor at very top pixel inside Notch (864, 1117.0) hits notchHotZone")
     check(TopHoverGeometry.isInNotchZone(NSPoint(x: 864, y: 1117.5), metrics: mbp16),
           "Cursor with subpixel top overshoot (864, 1117.5) hits notchHotZone")
 
-    // Exact visibleFrame.maxY (1083.0) where macOS WindowServer clamps the pointer under the Notch
+    // WindowServer 在刘海下沿夹紧坐标
     check(TopHoverGeometry.isInNotchZone(NSPoint(x: 864, y: 1083.0), metrics: mbp16),
           "Cursor clamped at Notch bottom boundary y == visibleFrame.maxY (864, 1083.0) hits notchHotZone")
     check(TopHoverGeometry.isInMenuBarBand(NSPoint(x: 864, y: 1083.0), metrics: mbp16),
           "Cursor at y == visibleFrame.maxY (864, 1083.0) hits menuBarBand")
 
-    // Below-Notch apron (y = 1055...1082) where visible cursor arrow touches the black Notch
-    for y: CGFloat in [1082.9, 1080.0, 1075.0, 1065.0, 1050.0] {
-        check(TopHoverGeometry.isInNotchZone(NSPoint(x: 864, y: y), metrics: mbp16),
-              "Cursor touching below-Notch apron (864, \(y)) hits notchHotZone")
-        check(TopHoverGeometry.isInTopTriggerZone(NSPoint(x: 864, y: y), metrics: mbp16),
-              "Cursor touching below-Notch apron (864, \(y)) hits topTriggerZone")
+    for sampleY: CGFloat in [1082.9, 1080.0, 1075.0, 1065.0, 1050.0] {
+        check(TopHoverGeometry.isInNotchZone(NSPoint(x: 864, y: sampleY), metrics: mbp16),
+              "Cursor touching below-Notch apron (864, \(sampleY)) hits notchHotZone")
+        check(TopHoverGeometry.isInTopTriggerZone(NSPoint(x: 864, y: sampleY), metrics: mbp16),
+              "Cursor touching below-Notch apron (864, \(sampleY)) hits topTriggerZone")
     }
 
-    // Left/right edges of the Notch (771 - 40, 956 + 40)
     check(TopHoverGeometry.isInNotchZone(NSPoint(x: 735, y: 1083.0), metrics: mbp16),
           "Cursor near left Notch edge (735, 1083.0) hits notchHotZone")
     check(TopHoverGeometry.isInNotchZone(NSPoint(x: 990, y: 1083.0), metrics: mbp16),
           "Cursor near right Notch edge (990, 1083.0) hits notchHotZone")
 
-    // Extreme screen corners (x = 0 and x = 1728 at y = 1117.0 and y = 1083.0)
     check(TopHoverGeometry.isInMenuBarBand(NSPoint(x: 0.0, y: 1117.0), metrics: mbp16),
           "Top-left corner (0.0, 1117.0) hits menuBarBand")
     check(TopHoverGeometry.isInMenuBarBand(NSPoint(x: 1728.0, y: 1117.0), metrics: mbp16),
@@ -2905,13 +2999,11 @@ func runSelfTests() -> Int32 {
     check(TopHoverGeometry.isInMenuBarBand(NSPoint(x: 1728.0, y: 1083.0), metrics: mbp16),
           "Bottom-right of menu bar (1728.0, 1083.0) hits menuBarBand")
 
-    // Normal desktop content area must NOT trigger top hover
     check(!TopHoverGeometry.isInTopTriggerZone(NSPoint(x: 864, y: 950.0), metrics: mbp16),
           "Mid-upper content area (864, 950.0) does not falsely trigger top hover")
     check(!TopHoverGeometry.isInTopTriggerZone(NSPoint(x: 200, y: 1060.0), metrics: mbp16),
           "Window titlebar far from Notch (200, 1060.0) does not falsely trigger menuBarBand")
 
-    // 2. Real NSScreen.main verification if available
     if let main = NSScreen.main {
         let realM = TopHoverGeometry.ScreenMetrics(screen: main)
         let midX = main.frame.midX
@@ -2923,7 +3015,6 @@ func runSelfTests() -> Int32 {
               "Real NSScreen.main below-Notch apron (midX, visibleFrame.maxY - 20) hits topTriggerZone")
     }
 
-    // 3. State machine (pollMouse / firstCollapseArmed / menuBarSuppressed) verification
     let savedPinned = Settings.pinned
     let savedHover = Settings.hoverReveal
     defer {
@@ -2936,24 +3027,20 @@ func runSelfTests() -> Int32 {
     let d = AppDelegate()
     let t0 = Date()
 
-    // (a) Hovering at Notch bottom boundary (864, 1083) reveals within 0.09s
     d.isRevealed = false
     d.pollMouse(at: NSPoint(x: 864, y: 1083.0), now: t0, metricsOverride: mbp16, pressedButtons: 0)
     check(!d.isRevealed && d.hotZoneSince != nil, "Initial Notch hover arms hotZoneSince")
     d.pollMouse(at: NSPoint(x: 864, y: 1083.0), now: t0.addingTimeInterval(0.09), metricsOverride: mbp16, pressedButtons: 0)
     check(d.isRevealed, "Hovering at Notch bottom boundary (864, 1083.0) for 0.09s reveals clothesline")
 
-    // (b) Staying in Notch or below-Notch apron keeps clothesline revealed
     d.pollMouse(at: NSPoint(x: 864, y: 1070.0), now: t0.addingTimeInterval(1.0), metricsOverride: mbp16, pressedButtons: 0)
     check(d.isRevealed && d.awaySince == nil, "Remaining in Notch apron (864, 1070.0) keeps clothesline open")
 
-    // (c) Moving cursor down to content area (864, 400) retracts after 0.5s
     d.pollMouse(at: NSPoint(x: 864, y: 400.0), now: t0.addingTimeInterval(2.0), metricsOverride: mbp16, pressedButtons: 0)
     check(d.isRevealed && d.awaySince != nil, "Leaving panel starts awaySince timer")
     d.pollMouse(at: NSPoint(x: 864, y: 400.0), now: t0.addingTimeInterval(2.55), metricsOverride: mbp16, pressedButtons: 0)
     check(!d.isRevealed, "Leaving panel for >= 0.5s tucks clothesline")
 
-    // (d) Menu bar click suppression automatically clears when sliding into Notch
     d.menuBarSuppressed = true
     d.suppressedAtPoint = NSPoint(x: 1400, y: 1100)
     d.pollMouse(at: NSPoint(x: 864, y: 1100.0), now: t0.addingTimeInterval(3.0), metricsOverride: mbp16, pressedButtons: 0)
@@ -2961,12 +3048,10 @@ func runSelfTests() -> Int32 {
     d.pollMouse(at: NSPoint(x: 864, y: 1100.0), now: t0.addingTimeInterval(3.09), metricsOverride: mbp16, pressedButtons: 0)
     check(d.isRevealed, "Sliding from suppressed menu bar into Notch reveals clothesline")
 
-    // (e) firstCollapseArmed (heldUntilEnter) disarms once pointer visits keep-open zone
     d.firstCollapseArmed = true
     d.pollMouse(at: NSPoint(x: 864, y: 1117.0), now: t0.addingTimeInterval(4.0), metricsOverride: mbp16, pressedButtons: 0)
     check(!d.firstCollapseArmed, "Visiting Notch/panel disarms firstCollapseArmed (heldUntilEnter)")
 
-    // (f) 1-frame cursor dip out of Notch (< 0.12s) preserves hotZoneSince hysteresis
     d.tuck()
     let t1 = t0.addingTimeInterval(5.0)
     d.pollMouse(at: NSPoint(x: 864, y: 1083.0), now: t1, metricsOverride: mbp16, pressedButtons: 0)
@@ -2976,24 +3061,53 @@ func runSelfTests() -> Int32 {
     d.pollMouse(at: NSPoint(x: 864, y: 1083.0), now: t1.addingTimeInterval(0.09), metricsOverride: mbp16, pressedButtons: 0)
     check(d.isRevealed, "Returning to Notch within hysteresis completes reveal at 90ms")
 
-    // (g) Dragging a window (pressedButtons != 0) does NOT falsely trigger hover reveal
     d.tuck()
     let t2 = t0.addingTimeInterval(6.0)
     d.pollMouse(at: NSPoint(x: 864, y: 1083.0), now: t2, metricsOverride: mbp16, pressedButtons: 1)
     d.pollMouse(at: NSPoint(x: 864, y: 1083.0), now: t2.addingTimeInterval(0.30), metricsOverride: mbp16, pressedButtons: 1)
     check(!d.isRevealed, "Mouse button pressed (window drag) does not trigger hover reveal")
 
-    // (h) Rapid tuck() followed by reveal() cancels pending tuckOrderOutWorkItem
     d.reveal()
     d.tuck()
     check(d.tuckOrderOutWorkItem != nil, "tuck() schedules cancellable tuckOrderOutWorkItem")
     d.reveal()
     check(d.tuckOrderOutWorkItem == nil && d.isRevealed, "reveal() immediately cancels pending tuckOrderOutWorkItem")
 
-    // (i) Non-Notch external display & auto-hiding menu bar & degenerate zero rect edge cases
+    // 验证纯状态机从菜单栏移入刘海时重算唤醒延时
+    var pureState = ClotheslineHoverState()
+    let panelFrame = NSRect(x: 0, y: 845, width: 1728, height: Layout.panelHeight)
+    let act1 = ClotheslineHoverController.evaluate(
+        state: &pureState,
+        mouse: NSPoint(x: 200, y: 1095),
+        now: t0,
+        metrics: mbp16,
+        panelFrame: panelFrame,
+        pinned: false,
+        hoverRevealEnabled: true,
+        pressedButtons: 0,
+        isInteractionBusy: false
+    )
+    let act2 = ClotheslineHoverController.evaluate(
+        state: &pureState,
+        mouse: NSPoint(x: 864, y: 1083),
+        now: t0.addingTimeInterval(0.02),
+        metrics: mbp16,
+        panelFrame: panelFrame,
+        pinned: false,
+        hoverRevealEnabled: true,
+        pressedButtons: 0,
+        isInteractionBusy: false
+    )
+    if case .scheduleStationaryWakeup(let wait1) = act1,
+       case .scheduleStationaryWakeup(let wait2) = act2 {
+        check(wait1 > 0.15 && wait2 < 0.08, "ClotheslineHoverController shortens wakeup when entering Notch")
+    } else {
+        check(false, "ClotheslineHoverController returns scheduleStationaryWakeup while dwelling")
+    }
+
     let extDisplay = TopHoverGeometry.ScreenMetrics(
         frame: NSRect(x: 0, y: 0, width: 2560, height: 1440),
-        visibleFrame: NSRect(x: 0, y: 0, width: 2560, height: 1440), // auto-hiding menu bar
+        visibleFrame: NSRect(x: 0, y: 0, width: 2560, height: 1440),
         safeAreaTop: 0,
         statusBarThickness: 24,
         auxiliaryTopLeftArea: nil,
@@ -3006,7 +3120,6 @@ func runSelfTests() -> Int32 {
     check(!TopHoverGeometry.pointInRectInclusive(NSPoint(x: 0, y: 0), .zero),
           "Degenerate zero-width rect returns false without crashing")
 
-    // (j) Pure Insta360SceneGraphParser unit tests (valid payload + malformed JSON fallback)
     let validJson = """
     {
       "status_meta": {"running": true, "frames": 98765, "lastFrameAgeMs": -2},
@@ -3015,13 +3128,13 @@ func runSelfTests() -> Int32 {
       ]
     }
     """.data(using: .utf8)!
-    let parsedValid = Insta360SceneGraphParser.parse(data: validJson, defaultOnline: false, operationId: "test-valid")
+    let parsedValid = Insta360SceneGraphParser.parse(jsonData: validJson, defaultOnline: false, operationId: "test-valid")
     check(
         parsedValid == Insta360SceneGraphSnapshot(online: true, frames: 98765, ageMs: 15, zClearanceMm: 91.25),
         "Insta360SceneGraphParser decodes status_meta and normalizes negative ageMs to 15"
     )
     let malformedJson = Data("{broken".utf8)
-    let parsedFallback = Insta360SceneGraphParser.parse(data: malformedJson, defaultOnline: true, operationId: "test-bad")
+    let parsedFallback = Insta360SceneGraphParser.parse(jsonData: malformedJson, defaultOnline: true, operationId: "test-bad")
     check(
         parsedFallback == Insta360SceneGraphSnapshot(online: true, frames: 42665, ageMs: 15, zClearanceMm: 86.5),
         "Insta360SceneGraphParser falls back cleanly on malformed JSON"
