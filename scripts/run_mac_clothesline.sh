@@ -34,7 +34,7 @@ if [[ "${1:-}" == "--rollback" ]]; then
     pkill -f "${PROC_PATTERN}" >/dev/null 2>&1 || true
     sleep 0.3
     if ! open -n -a "${APP_BUNDLE}" >/dev/null 2>&1; then
-        nohup "${APP_BUNDLE}/Contents/MacOS/D1Clothesline" >/dev/null 2>&1 &
+        nohup "${APP_BUNDLE}/Contents/MacOS/D1Clothesline" </dev/null >/dev/null 2>&1 &
         disown || true
     fi
     if pgrep -f "D1LiveMonitor.app/Contents/MacOS/D1LiveMonitor" >/dev/null 2>&1; then
@@ -52,8 +52,15 @@ fi
 
 pkill -f "${PROC_PATTERN}" >/dev/null 2>&1 || true
 sleep 0.3
-if ! open -n -a "${APP_BUNDLE}" --args "$@" >/dev/null 2>&1; then
-    nohup "${APP_BUNDLE}/Contents/MacOS/D1Clothesline" "$@" >/dev/null 2>&1 &
-    disown || true
+if [[ $# -gt 0 ]]; then
+    if ! open -n -a "${APP_BUNDLE}" --args "$@" >/dev/null 2>&1; then
+        nohup "${APP_BUNDLE}/Contents/MacOS/D1Clothesline" "$@" </dev/null >/dev/null 2>&1 &
+        disown || true
+    fi
+else
+    if ! open -n -a "${APP_BUNDLE}" >/dev/null 2>&1; then
+        nohup "${APP_BUNDLE}/Contents/MacOS/D1Clothesline" </dev/null >/dev/null 2>&1 &
+        disown || true
+    fi
 fi
 echo "✅ 已启动 D1 视频晾衣绳 — 鼠标停在屏幕顶部菜单栏（或按 ⌃⌥D）放下晾衣绳；退出：$0 --stop"
