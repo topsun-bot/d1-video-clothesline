@@ -10,8 +10,18 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_BUNDLE="${REPO_ROOT}/D1Clothesline.app"
 PROC_PATTERN="D1Clothesline.app/Contents/MacOS/D1Clothesline"
 
-if [[ "${1:-}" == "--stop" ]]; then
+terminate_existing_clothesline() {
+    pkill -CONT -f "${PROC_PATTERN}" >/dev/null 2>&1 || true
     if pkill -f "${PROC_PATTERN}" >/dev/null 2>&1; then
+        sleep 0.25
+        pkill -9 -f "${PROC_PATTERN}" >/dev/null 2>&1 || true
+        return 0
+    fi
+    return 1
+}
+
+if [[ "${1:-}" == "--stop" ]]; then
+    if terminate_existing_clothesline; then
         echo "✅ 已退出 D1 视频晾衣绳"
     else
         echo "ℹ️  D1 视频晾衣绳没有在运行"
@@ -31,8 +41,8 @@ if [[ "${1:-}" == "--rollback" ]]; then
         scripts/run_mac_floating_monitor.sh
     "${REPO_ROOT}/macos_clothesline/build_app.sh"
     "${REPO_ROOT}/macos_monitor/build_app.sh"
-    pkill -f "${PROC_PATTERN}" >/dev/null 2>&1 || true
-    sleep 0.3
+    terminate_existing_clothesline || true
+    sleep 0.2
     if ! open -n -a "${APP_BUNDLE}" >/dev/null 2>&1; then
         nohup "${APP_BUNDLE}/Contents/MacOS/D1Clothesline" </dev/null >/dev/null 2>&1 &
         disown || true
@@ -50,8 +60,8 @@ if [[ $REBUILD -eq 1 ]] || [[ ! -x "${APP_BUNDLE}/Contents/MacOS/D1Clothesline" 
     "${REPO_ROOT}/macos_clothesline/build_app.sh"
 fi
 
-pkill -f "${PROC_PATTERN}" >/dev/null 2>&1 || true
-sleep 0.3
+terminate_existing_clothesline || true
+sleep 0.2
 if [[ $# -gt 0 ]]; then
     if ! open -n -a "${APP_BUNDLE}" --args "$@" >/dev/null 2>&1; then
         nohup "${APP_BUNDLE}/Contents/MacOS/D1Clothesline" "$@" </dev/null >/dev/null 2>&1 &
