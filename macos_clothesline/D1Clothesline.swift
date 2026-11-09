@@ -529,7 +529,7 @@ final class FrameHub {
 
     private func loop() {
         while isRunning {
-            runOnce()
+            autoreleasepool { runOnce() }
             if isRunning { Thread.sleep(forTimeInterval: 0.8) }
         }
     }
@@ -596,41 +596,59 @@ final class FrameHub {
         process = proc
         lock.unlock()
 
-        var buffer = Data()
-        let soi = Data([0xFF, 0xD8])
-        let eoi = Data([0xFF, 0xD9])
-
+        var pendingBytes = Data()
         while isRunning && proc.isRunning {
-            let chunk = handle.availableData
-            if chunk.isEmpty { break }
-            buffer.append(chunk)
-
-            var latest: Data?
-            while true {
-                guard let startRange = buffer.range(of: soi) else {
-                    if buffer.count > 2_000_000 { buffer.removeAll() }
-                    break
-                }
-                let from = startRange.upperBound
-                guard from < buffer.endIndex,
-                      let endRange = buffer.range(of: eoi, options: [], in: from..<buffer.endIndex) else {
-                    if startRange.lowerBound > 0 { buffer.removeSubrange(0..<startRange.lowerBound) }
-                    break
-                }
-                latest = buffer.subdata(in: startRange.lowerBound..<endRange.upperBound)
-                buffer.removeSubrange(0..<endRange.upperBound)
-            }
-
-            guard let jpg = latest else { continue }
-            lock.lock(); _lastFrameAt = Date(); let want = _needsFrames; lock.unlock()
-            guard want,
-                  let imageSource = CGImageSourceCreateWithData(jpg as CFData, nil),
-                  let img = CGImageSourceCreateImageAtIndex(
-                      imageSource, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary) else { continue }
-            DispatchQueue.main.async { [weak self] in self?.onFrame?(img) }
+            // 后台线程池不排空会囤 NSData
+            let pipeStillOpen = autoreleasepool { readNextChunk(from: handle, into: &pendingBytes) }
+            if !pipeStillOpen { break }
         }
         if proc.isRunning { proc.terminate() }
         lock.lock(); if process === proc { process = nil }; lock.unlock()
+    }
+
+    /// 返回 false 表示管道 EOF
+    private func readNextChunk(from handle: FileHandle, into pendingBytes: inout Data) -> Bool {
+        let chunk = handle.availableData
+        guard !chunk.isEmpty else { return false }
+        pendingBytes.append(chunk)
+        guard let jpegBytes = MJPEGFrameSplitter.extractLatestFrame(from: &pendingBytes) else { return true }
+        lock.lock(); _lastFrameAt = Date(); let wantsFrames = _needsFrames; lock.unlock()
+        guard wantsFrames,
+              let imageSource = CGImageSourceCreateWithData(jpegBytes as CFData, nil),
+              let frameImage = CGImageSourceCreateImageAtIndex(
+                  imageSource, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary) else { return true }
+        DispatchQueue.main.async { [weak self] in self?.onFrame?(frameImage) }
+        return true
+    }
+}
+
+enum MJPEGFrameSplitter {
+    static let startMarker = Data([0xFF, 0xD8])
+    static let endMarker = Data([0xFF, 0xD9])
+    static let maxPendingBytes = 2_000_000
+
+    /// 只留最新帧，积压帧直接丢
+    static func extractLatestFrame(from pendingBytes: inout Data) -> Data? {
+        var latestFrame: Data?
+        while true {
+            guard let startRange = pendingBytes.range(of: startMarker) else {
+                if pendingBytes.count > maxPendingBytes { pendingBytes.removeAll() }
+                return latestFrame
+            }
+            let searchFrom = startRange.upperBound
+            guard searchFrom < pendingBytes.endIndex,
+                  let endRange = pendingBytes.range(
+                      of: endMarker, options: [], in: searchFrom..<pendingBytes.endIndex) else {
+                // 坏流无结束符时防无界增长
+                if pendingBytes.count > maxPendingBytes { pendingBytes.removeAll(); return latestFrame }
+                if startRange.lowerBound > pendingBytes.startIndex {
+                    pendingBytes.removeSubrange(pendingBytes.startIndex..<startRange.lowerBound)
+                }
+                return latestFrame
+            }
+            latestFrame = pendingBytes.subdata(in: startRange.lowerBound..<endRange.upperBound)
+            pendingBytes.removeSubrange(pendingBytes.startIndex..<endRange.upperBound)
+        }
     }
 }
 
@@ -689,38 +707,44 @@ final class Telemetry {
         let decoder = JSONDecoder()
         var tick = 0
         while isRunning {
-            for spec in allFeeds {
-                guard let key = spec.armKey, let ip = spec.ip, let jointAngles = Self.queryArm(ip: ip) else { continue }
-                lock.lock(); jointsByArm[key] = jointAngles; seen[key] = Date(); lock.unlock()
+            autoreleasepool {
+                for spec in allFeeds {
+                    guard let key = spec.armKey, let ip = spec.ip, let jointAngles = Self.queryArm(ip: ip) else { continue }
+                    lock.lock(); jointsByArm[key] = jointAngles; seen[key] = Date(); lock.unlock()
+                }
+                if tick % 3 == 0, let url = statusURL {
+                    requestHubStatus(session: session, url: url, decoder: decoder)
+                }
+                DispatchQueue.main.async { [weak self] in self?.onUpdate?() }
             }
-            if tick % 3 == 0, let url = statusURL {
-                session.dataTask(with: url) { [weak self] payloadData, _, err in
-                    guard let self, err == nil, let payloadData else { return }
-                    let decoded: HubStatusPayload
-                    do {
-                        decoded = try decoder.decode(HubStatusPayload.self, from: payloadData)
-                    } catch {
-                        TraceLogger.warn(
-                            operationId: TraceLogger.makeOperationId(prefix: "hub"),
-                            component: "Telemetry",
-                            message: "Failed decoding \(url.absoluteString)",
-                            error: error
-                        )
-                        return
-                    }
-                    self.lock.lock()
-                    if let continuous = decoded.continuous_mode { self.hub.continuous = continuous }
-                    if let cycle = decoded.cycle_count { self.hub.cycle = cycle }
-                    if let skill = decoded.current_skill { self.hub.skill = skill }
-                    if let phase = decoded.current_phase { self.hub.phase = phase }
-                    self.hubSeen = Date()
-                    self.lock.unlock()
-                }.resume()
-            }
-            DispatchQueue.main.async { [weak self] in self?.onUpdate?() }
             tick += 1
             Thread.sleep(forTimeInterval: 0.3)
         }
+    }
+
+    private func requestHubStatus(session: URLSession, url: URL, decoder: JSONDecoder) {
+        session.dataTask(with: url) { [weak self] payloadData, _, err in
+            guard let self, err == nil, let payloadData else { return }
+            let decoded: HubStatusPayload
+            do {
+                decoded = try decoder.decode(HubStatusPayload.self, from: payloadData)
+            } catch {
+                TraceLogger.warn(
+                    operationId: TraceLogger.makeOperationId(prefix: "hub"),
+                    component: "Telemetry",
+                    message: "Failed decoding \(url.absoluteString)",
+                    error: error
+                )
+                return
+            }
+            self.lock.lock()
+            if let continuous = decoded.continuous_mode { self.hub.continuous = continuous }
+            if let cycle = decoded.cycle_count { self.hub.cycle = cycle }
+            if let skill = decoded.current_skill { self.hub.skill = skill }
+            if let phase = decoded.current_phase { self.hub.phase = phase }
+            self.hubSeen = Date()
+            self.lock.unlock()
+        }.resume()
     }
 
     /// 只读查询绝不发送运动控制指令
@@ -814,10 +838,12 @@ final class Insta360Hub {
         var tick = 0
         while isRunning {
             if needsFrames {
-                if tick % 4 == 0 {
-                    runBridgeCapture()
+                autoreleasepool {
+                    if tick % 4 == 0 {
+                        runBridgeCapture()
+                    }
+                    reloadLocalFiles()
                 }
-                reloadLocalFiles()
                 DispatchQueue.main.async { [weak self] in self?.onUpdate?() }
             }
             tick += 1
@@ -3161,6 +3187,14 @@ func runSelfTests() -> Int32 {
         parsedFallback == Insta360SceneGraphSnapshot(online: true, frames: 42665, ageMs: 15, zClearanceMm: 86.5),
         "Insta360SceneGraphParser falls back cleanly on malformed JSON"
     )
+
+    var twoFramesBytes = Data([0x00, 0xFF, 0xD8, 0x01, 0xFF, 0xD9, 0xFF, 0xD8, 0x02, 0xFF, 0xD9, 0xFF, 0xD8, 0x03])
+    let newestFrame = MJPEGFrameSplitter.extractLatestFrame(from: &twoFramesBytes)
+    check(newestFrame == Data([0xFF, 0xD8, 0x02, 0xFF, 0xD9]) && twoFramesBytes == Data([0xFF, 0xD8, 0x03]),
+          "MJPEGFrameSplitter keeps newest frame and partial tail")
+    var corruptStreamBytes = Data([0xFF, 0xD8]) + Data(repeating: 0x11, count: MJPEGFrameSplitter.maxPendingBytes + 1)
+    _ = MJPEGFrameSplitter.extractLatestFrame(from: &corruptStreamBytes)
+    check(corruptStreamBytes.isEmpty, "MJPEGFrameSplitter caps pending bytes when end marker never arrives")
 
     print("Self-test summary: \(failures.isEmpty ? "ALL PASSED" : "\(failures.count) FAILED")")
     return failures.isEmpty ? 0 : 1

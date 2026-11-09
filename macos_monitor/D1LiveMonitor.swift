@@ -783,21 +783,25 @@ final class LiveStreamController {
 
     private func videoStreamLoop() {
         while isRunning {
-            state.lock.lock()
-            let mode = state.streamMode
-            state.lock.unlock()
-
-            if mode == .hubHTTP {
-                runHubSnapshotPolling()
-            } else if mode == .insta360HUD || mode == .insta360Rectilinear {
-                reloadInsta360LocalFiles()
-                DispatchQueue.main.async { [weak self] in self?.onFrameUpdate() }
-                Thread.sleep(forTimeInterval: 0.5)
-            } else {
-                let url = (mode == .rtspHD) ? rtspHDURL : rtspSubURL
-                runFFmpegMJPEGPipe(rtspURL: url, isHD: mode == .rtspHD)
-            }
+            autoreleasepool { runOneVideoStreamSession() }
             if isRunning { Thread.sleep(forTimeInterval: 0.4) }
+        }
+    }
+
+    private func runOneVideoStreamSession() {
+        state.lock.lock()
+        let mode = state.streamMode
+        state.lock.unlock()
+
+        if mode == .hubHTTP {
+            runHubSnapshotPolling()
+        } else if mode == .insta360HUD || mode == .insta360Rectilinear {
+            reloadInsta360LocalFiles()
+            DispatchQueue.main.async { [weak self] in self?.onFrameUpdate() }
+            Thread.sleep(forTimeInterval: 0.5)
+        } else {
+            let url = (mode == .rtspHD) ? rtspHDURL : rtspSubURL
+            runFFmpegMJPEGPipe(rtspURL: url, isHD: mode == .rtspHD)
         }
     }
 
@@ -813,10 +817,12 @@ final class LiveStreamController {
     private func insta360Loop() {
         var tick = 0
         while isRunning {
-            if tick % 4 == 0 {
-                runInsta360BridgeCapture()
+            autoreleasepool {
+                if tick % 4 == 0 {
+                    runInsta360BridgeCapture()
+                }
+                reloadInsta360LocalFiles()
             }
-            reloadInsta360LocalFiles()
             DispatchQueue.main.async { [weak self] in self?.onFrameUpdate() }
             tick += 1
             for _ in 0..<15 {
@@ -920,30 +926,32 @@ final class LiveStreamController {
             state.lock.unlock()
             if currentMode != .hubHTTP { break }
 
-            let semaphore = DispatchSemaphore(value: 0)
-            let task = session.dataTask(with: snapURL) { [weak self] responseBytes, resp, requestError in
-                defer { semaphore.signal() }
-                if let requestError {
-                    TraceLogger.warn(
-                        operationId: TraceLogger.makeOperationId(prefix: "hubsnap"),
-                        component: "LiveStreamController",
-                        message: "Hub snapshot request failed",
-                        error: requestError
-                    )
-                    return
+            autoreleasepool {
+                let semaphore = DispatchSemaphore(value: 0)
+                let task = session.dataTask(with: snapURL) { [weak self] responseBytes, resp, requestError in
+                    defer { semaphore.signal() }
+                    if let requestError {
+                        TraceLogger.warn(
+                            operationId: TraceLogger.makeOperationId(prefix: "hubsnap"),
+                            component: "LiveStreamController",
+                            message: "Hub snapshot request failed",
+                            error: requestError
+                        )
+                        return
+                    }
+                    guard let self = self,
+                          let http = resp as? HTTPURLResponse,
+                          http.statusCode == 200,
+                          let responseBytes = responseBytes,
+                          responseBytes.count > 2000,
+                          let img = NSImage(data: responseBytes) else {
+                        return
+                    }
+                    self.deliverFrame(img)
                 }
-                guard let self = self,
-                      let http = resp as? HTTPURLResponse,
-                      http.statusCode == 200,
-                      let responseBytes = responseBytes,
-                      responseBytes.count > 2000,
-                      let img = NSImage(data: responseBytes) else {
-                    return
-                }
-                self.deliverFrame(img)
+                task.resume()
+                _ = semaphore.wait(timeout: .now() + 2.0)
             }
-            task.resume()
-            _ = semaphore.wait(timeout: .now() + 2.0)
             Thread.sleep(forTimeInterval: 0.14)
         }
     }
@@ -1019,43 +1027,53 @@ final class LiveStreamController {
             return
         }
 
-        var buffer = Data()
-        let soiMarker = Data([0xFF, 0xD8])
-        let eoiMarker = Data([0xFF, 0xD9])
-
+        var pendingBytes = Data()
         while isRunning && proc.isRunning {
-            let chunk = handle.availableData
-            if chunk.isEmpty {
-                break
-            }
-            buffer.append(chunk)
-
-            // 丢弃堆积帧保最新帧
-            var latestJPEG: Data?
-            while true {
-                guard let soiRange = buffer.range(of: soiMarker) else {
-                    if buffer.count > 1_500_000 { buffer.removeAll() }
-                    break
-                }
-                let searchStart = soiRange.upperBound
-                guard searchStart < buffer.endIndex,
-                      let eoiRange = buffer.range(of: eoiMarker, options: [], in: searchStart..<buffer.endIndex) else {
-                    if soiRange.lowerBound > 0 {
-                        buffer.removeSubrange(0..<soiRange.lowerBound)
-                    }
-                    break
-                }
-                let frameData = buffer.subdata(in: soiRange.lowerBound..<eoiRange.upperBound)
-                buffer.removeSubrange(0..<eoiRange.upperBound)
-                latestJPEG = frameData
-            }
-
-            if let jpg = latestJPEG, let img = NSImage(data: jpg) {
-                deliverFrame(img)
-            }
+            // 后台线程池不排空会囤 NSData
+            let pipeStillOpen = autoreleasepool { readNextMJPEGChunk(from: handle, into: &pendingBytes) }
+            if !pipeStillOpen { break }
         }
 
         terminateFFmpeg()
+    }
+
+    /// 返回 false 表示管道 EOF
+    private func readNextMJPEGChunk(from handle: FileHandle, into pendingBytes: inout Data) -> Bool {
+        let chunk = handle.availableData
+        guard !chunk.isEmpty else { return false }
+        pendingBytes.append(chunk)
+        guard let jpegBytes = Self.extractLatestJPEGFrame(from: &pendingBytes),
+              let frameImage = NSImage(data: jpegBytes) else { return true }
+        deliverFrame(frameImage)
+        return true
+    }
+
+    private static let jpegStartMarker = Data([0xFF, 0xD8])
+    private static let jpegEndMarker = Data([0xFF, 0xD9])
+    private static let maxPendingBytes = 1_500_000
+
+    /// 丢弃堆积帧保最新帧
+    static func extractLatestJPEGFrame(from pendingBytes: inout Data) -> Data? {
+        var latestJPEG: Data?
+        while true {
+            guard let soiRange = pendingBytes.range(of: jpegStartMarker) else {
+                if pendingBytes.count > maxPendingBytes { pendingBytes.removeAll() }
+                return latestJPEG
+            }
+            let searchStart = soiRange.upperBound
+            guard searchStart < pendingBytes.endIndex,
+                  let eoiRange = pendingBytes.range(
+                      of: jpegEndMarker, options: [], in: searchStart..<pendingBytes.endIndex) else {
+                // 坏流无结束符时防无界增长
+                if pendingBytes.count > maxPendingBytes { pendingBytes.removeAll(); return latestJPEG }
+                if soiRange.lowerBound > pendingBytes.startIndex {
+                    pendingBytes.removeSubrange(pendingBytes.startIndex..<soiRange.lowerBound)
+                }
+                return latestJPEG
+            }
+            latestJPEG = pendingBytes.subdata(in: soiRange.lowerBound..<eoiRange.upperBound)
+            pendingBytes.removeSubrange(pendingBytes.startIndex..<eoiRange.upperBound)
+        }
     }
 
     private func deliverFrame(_ img: NSImage) {
@@ -1087,54 +1105,56 @@ final class LiveStreamController {
 
         var tick = 0
         while isRunning {
-            for key in ["left_103", "center_102", "right_101"] {
-                state.lock.lock()
-                let ip = state.arms[key]?.ip ?? ""
-                state.lock.unlock()
-                if !ip.isEmpty, let joints = queryArmUDP(ip: ip, port: 19001) {
+            autoreleasepool {
+                for key in ["left_103", "center_102", "right_101"] {
                     state.lock.lock()
-                    state.arms[key]?.joints = joints
-                    state.arms[key]?.online = true
+                    let ip = state.arms[key]?.ip ?? ""
                     state.lock.unlock()
-                } else {
-                    state.lock.lock()
-                    state.arms[key]?.online = false
-                    state.lock.unlock()
-                }
-            }
-
-            // 降频轮询中控减负
-            if tick % 3 == 0, let url = statusURL {
-                let task = session.dataTask(with: url) { [weak self] payloadData, _, requestError in
-                    guard let self = self,
-                          requestError == nil,
-                          let payloadData = payloadData else {
-                        return
+                    if !ip.isEmpty, let joints = queryArmUDP(ip: ip, port: 19001) {
+                        state.lock.lock()
+                        state.arms[key]?.joints = joints
+                        state.arms[key]?.online = true
+                        state.lock.unlock()
+                    } else {
+                        state.lock.lock()
+                        state.arms[key]?.online = false
+                        state.lock.unlock()
                     }
-                    let decoded: HubStatusPayload
-                    do {
-                        decoded = try decoder.decode(HubStatusPayload.self, from: payloadData)
-                    } catch {
-                        TraceLogger.warn(
-                            operationId: TraceLogger.makeOperationId(prefix: "hub"),
-                            component: "LiveStreamController",
-                            message: "Failed decoding \(url.absoluteString)",
-                            error: error
-                        )
-                        return
-                    }
-                    self.state.lock.lock()
-                    if let cont = decoded.continuous_mode { self.state.continuousMode = cont }
-                    if let cycleCount = decoded.cycle_count { self.state.cycleCount = cycleCount }
-                    if let skillName = decoded.current_skill { self.state.currentSkill = skillName }
-                    if let phaseName = decoded.current_phase { self.state.currentPhase = phaseName }
-                    self.state.lock.unlock()
                 }
-                task.resume()
-            }
 
-            DispatchQueue.main.async { [weak self] in
-                self?.onFrameUpdate()
+                // 降频轮询中控减负
+                if tick % 3 == 0, let url = statusURL {
+                    let task = session.dataTask(with: url) { [weak self] payloadData, _, requestError in
+                        guard let self = self,
+                              requestError == nil,
+                              let payloadData = payloadData else {
+                            return
+                        }
+                        let decoded: HubStatusPayload
+                        do {
+                            decoded = try decoder.decode(HubStatusPayload.self, from: payloadData)
+                        } catch {
+                            TraceLogger.warn(
+                                operationId: TraceLogger.makeOperationId(prefix: "hub"),
+                                component: "LiveStreamController",
+                                message: "Failed decoding \(url.absoluteString)",
+                                error: error
+                            )
+                            return
+                        }
+                        self.state.lock.lock()
+                        if let cont = decoded.continuous_mode { self.state.continuousMode = cont }
+                        if let cycleCount = decoded.cycle_count { self.state.cycleCount = cycleCount }
+                        if let skillName = decoded.current_skill { self.state.currentSkill = skillName }
+                        if let phaseName = decoded.current_phase { self.state.currentPhase = phaseName }
+                        self.state.lock.unlock()
+                    }
+                    task.resume()
+                }
+
+                DispatchQueue.main.async { [weak self] in
+                    self?.onFrameUpdate()
+                }
             }
             tick += 1
             Thread.sleep(forTimeInterval: 0.28)
@@ -1678,6 +1698,14 @@ func runSelfTests() -> Int32 {
             && encodedString.contains("\"skill\":\"grasp_and_plug_loop\""),
         "HubControlCommand encodes operation_id and skill payload cleanly"
     )
+
+    var twoFramesBytes = Data([0x00, 0xFF, 0xD8, 0x01, 0xFF, 0xD9, 0xFF, 0xD8, 0x02, 0xFF, 0xD9, 0xFF, 0xD8, 0x03])
+    let newestFrame = LiveStreamController.extractLatestJPEGFrame(from: &twoFramesBytes)
+    check(newestFrame == Data([0xFF, 0xD8, 0x02, 0xFF, 0xD9]) && twoFramesBytes == Data([0xFF, 0xD8, 0x03]),
+          "extractLatestJPEGFrame keeps newest frame and partial tail")
+    var corruptStreamBytes = Data([0xFF, 0xD8]) + Data(repeating: 0x11, count: 1_500_001)
+    _ = LiveStreamController.extractLatestJPEGFrame(from: &corruptStreamBytes)
+    check(corruptStreamBytes.isEmpty, "extractLatestJPEGFrame caps pending bytes when end marker never arrives")
 
     print("Self-test summary: \(failures.isEmpty ? "ALL PASSED" : "\(failures.count) FAILED")")
     return failures.isEmpty ? 0 : 1
